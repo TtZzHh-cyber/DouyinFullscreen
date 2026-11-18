@@ -1,0 +1,568 @@
+name: Build Fullscreen APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p proj2/app/src/main/java/com/example/douyinfullscreen proj2/app/src/main/assets proj2/app/src/main/res/values
+          cat > proj2/settings.gradle <<'EOF_X'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url 'https://api.xposed.info/' }
+              }
+          }
+          rootProject.name = 'DouyinFullscreen'
+          include ':app'
+          EOF_X
+          cat > proj2/build.gradle <<'EOF_X'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_X
+          cat > proj2/gradle.properties <<'EOF_X'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_X
+          cat > proj2/app/build.gradle <<'EOF_X'
+          plugins { id 'com.android.application' }
+          
+          android {
+              namespace 'com.example.douyinfullscreen'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.douyinfullscreen'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          
+          dependencies {
+              compileOnly 'de.robv.android.xposed:api:82'
+          }
+          EOF_X
+          cat > proj2/app/src/main/AndroidManifest.xml <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="抖音全屏"
+                  android:allowBackup="false">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="抖音首页视频铺满全屏，底栏透明" />
+                  <meta-data android:name="xposedminversion" android:value="82" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          EOF_X
+          cat > proj2/app/src/main/res/values/arrays.xml <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>com.ss.android.ugc.aweme</item>
+              </string-array>
+          </resources>
+          EOF_X
+          cat > proj2/app/src/main/assets/xposed_init <<'EOF_X'
+          com.example.douyinfullscreen.MainHook
+          EOF_X
+          cat > proj2/app/src/main/java/com/example/douyinfullscreen/MainHook.java <<'EOF_X'
+          package com.example.douyinfullscreen;
+          
+          import android.app.Activity;
+          import android.app.Dialog;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.graphics.Rect;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Build;
+          import android.os.SystemClock;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.ViewTreeObserver;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.widget.CompoundButton;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.Switch;
+          import android.widget.TextView;
+          
+          import java.lang.ref.WeakReference;
+          
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+          
+          /**
+           * 抖音首页视频流铺满全屏：
+           * 1. 把首页视频翻页控件（RTViewPager）向下延伸到屏幕底部；
+           * 2. 底部标签栏设为透明（仍可点击）。
+           * 所有改动在绘制前一次完成，不会在翻页过程中改变布局，避免黑屏闪烁。
+           */
+          public class MainHook implements IXposedHookLoadPackage {
+          
+              private static final String PKG = "com.ss.android.ugc.aweme";
+              private static final String TAG = "[DouyinFullscreen] ";
+              private static final String PREF = "douyin_fullscreen_cfg";
+              private static final String ENTRY_TAG = "dfs_entry";
+              private static final String PAGER_CLASS = "com.ss.android.ugc.aweme.common.widget.RTViewPager";
+              private static final String[] MARKERS = {"账号与安全", "隐私设置", "通用设置"};
+          
+              private static volatile boolean fullscreen = true;
+              private static volatile boolean barTransparent = true;
+              private static boolean cfgLoaded = false;
+              private static boolean menuShowing = false;
+          
+              // ---- 首页状态（仅在主线程使用）----
+              private static WeakReference<View> listenerDecor;
+              private static WeakReference<View> pagerRef;
+              private static WeakReference<View> barRef;
+              private static final Rect tmpRect = new Rect();
+              private static final int[] tmpLoc = new int[2];
+              private static long lastScan = 0;
+              private static long lastBarScan = 0;
+              private static long lastCancel = 0;
+              private static int cancels = 0;
+              private static int origMargin = Integer.MIN_VALUE;
+              private static int barGap = 0;
+              private static boolean failed = false;
+              private static boolean barHidden = false;
+              private static float barOrigAlpha = 1f;
+          
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+                  if (!PKG.equals(lpparam.packageName) || !PKG.equals(lpparam.processName)) return;
+                  try {
+                      XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+                          @Override
+                          protected void afterHookedMethod(MethodHookParam p) {
+                              try {
+                                  Activity a = (Activity) p.thisObject;
+                                  loadCfg(a);
+                                  if (a.getClass().getName().endsWith(".main.MainActivity")) {
+                                      attachFeedListener(a);
+                                  } else {
+                                      scheduleEntryCheck(a);
+                                  }
+                              } catch (Throwable t) {
+                                  XposedBridge.log(TAG + "onResume 处理失败: " + t);
+                              }
+                          }
+                      });
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "hook onResume 失败: " + t);
+                  }
+              }
+          
+              // ================= 首页铺满 =================
+          
+              private static void attachFeedListener(Activity a) {
+                  final View decor = a.getWindow().getDecorView();
+                  if (listenerDecor != null && listenerDecor.get() == decor) return;
+                  listenerDecor = new WeakReference<View>(decor);
+                  pagerRef = null;
+                  barRef = null;
+                  failed = false;
+                  barHidden = false;
+                  origMargin = Integer.MIN_VALUE;
+                  cancels = 0;
+          
+                  if (fullscreen) makeNavBarTransparent(a);
+          
+                  ViewTreeObserver vto = decor.getViewTreeObserver();
+                  if (!vto.isAlive()) return;
+                  vto.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+                      @Override
+                      public boolean onPreDraw() {
+                          try {
+                              // 返回 false 会取消本帧绘制并立即重新布局，使改动在同一帧生效，不会闪烁
+                              return !feedFix(decor);
+                          } catch (Throwable t) {
+                              return true;
+                          }
+                      }
+                  });
+              }
+          
+              private static void makeNavBarTransparent(Activity a) {
+                  try {
+                      Window w = a.getWindow();
+                      w.setNavigationBarColor(Color.TRANSPARENT);
+                      if (Build.VERSION.SDK_INT >= 29) w.setNavigationBarContrastEnforced(false);
+                  } catch (Throwable ignored) { }
+              }
+          
+              /** 每帧绘制前调用：返回 true 表示改动了布局，需要取消本帧绘制并重新布局 */
+              private static boolean feedFix(View decor) {
+                  int W = decor.getWidth();
+                  int H = decor.getHeight();
+                  if (W <= 0 || H <= 0) return false;
+                  long now = SystemClock.uptimeMillis();
+          
+                  View pager = pagerRef != null ? pagerRef.get() : null;
+                  if (pager == null || pager.getWindowToken() == null || !isFeedVisible(pager, W, H)) {
+                      // 不在首页视频流（或视频流还没出现）：恢复底栏，并低频重新寻找视频流
+                      restoreBar();
+                      if (now - lastScan >= 500) {
+                          lastScan = now;
+                          View found = findFeedPager(decor, W, H);
+                          if (found != pager) {
+                              pagerRef = found == null ? null : new WeakReference<View>(found);
+                              barRef = null;
+                              failed = false;
+                              origMargin = Integer.MIN_VALUE;
+                              cancels = 0;
+                          }
+                      }
+                      return false;
+                  }
+          
+                  if (!fullscreen) {
+                      revertMargin(pager);
+                      restoreBar();
+                      return false;
+                  }
+          
+                  pager.getLocationInWindow(tmpLoc);
+                  int gap = H - (tmpLoc[1] + pager.getHeight());
+                  boolean relayout = false;
+          
+                  if (!failed && gap >= 0.02f * H && gap <= 0.10f * H) {
+                      if (cancels >= 3 && now - lastCancel < 2000) {
+                          // 连续多次调整仍未生效：本轮放行，避免死循环
+                      } else {
+                          if (cancels >= 3) cancels = 0;
+                          ViewGroup.LayoutParams lp = pager.getLayoutParams();
+                          if (lp instanceof ViewGroup.MarginLayoutParams) {
+                              ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
+                              if (origMargin == Integer.MIN_VALUE) origMargin = m.bottomMargin;
+                              if (origMargin - (m.bottomMargin - gap) > 0.12f * H) {
+                                  // 累计调整过大，说明这个布局不吃这种调整：放弃并还原
+                                  failed = true;
+                                  m.bottomMargin = origMargin;
+                                  pager.setLayoutParams(m);
+                              } else {
+                                  if (barGap == 0) barGap = gap;
+                                  m.bottomMargin -= gap;
+                                  pager.setLayoutParams(m);
+                                  cancels++;
+                                  lastCancel = now;
+                                  relayout = true;
+                              }
+                          } else {
+                              failed = true;
+                          }
+                      }
+                  } else if (gap < 2) {
+                      cancels = 0;
+                  }
+          
+                  if (barTransparent && barGap > 0) {
+                      View bar = barRef != null ? barRef.get() : null;
+                      if ((bar == null || bar.getWindowToken() == null) && now - lastBarScan >= 500) {
+                          lastBarScan = now;
+                          bar = findBar(decor, pager, W, H, barGap);
+                          barRef = bar == null ? null : new WeakReference<View>(bar);
+                          barHidden = false;
+                      }
+                      if (bar != null && bar.getWindowToken() != null) {
+                          if (!barHidden) {
+                              barOrigAlpha = bar.getAlpha();
+                              barHidden = true;
+                          }
+                          if (bar.getAlpha() != 0f) bar.setAlpha(0f);
+                      }
+                  } else {
+                      restoreBar();
+                  }
+                  return relayout;
+              }
+          
+              private static void revertMargin(View pager) {
+                  if (origMargin == Integer.MIN_VALUE) return;
+                  ViewGroup.LayoutParams lp = pager.getLayoutParams();
+                  if (lp instanceof ViewGroup.MarginLayoutParams) {
+                      ((ViewGroup.MarginLayoutParams) lp).bottomMargin = origMargin;
+                      pager.setLayoutParams(lp);
+                  }
+                  origMargin = Integer.MIN_VALUE;
+                  cancels = 0;
+              }
+          
+              private static void restoreBar() {
+                  if (!barHidden) return;
+                  barHidden = false;
+                  View bar = barRef != null ? barRef.get() : null;
+                  if (bar != null) bar.setAlpha(barOrigAlpha);
+              }
+          
+              private static boolean isFeedVisible(View pager, int W, int H) {
+                  if (!pager.isShown() || pager.getWidth() <= 0) return false;
+                  if (!pager.getGlobalVisibleRect(tmpRect)) return false;
+                  return tmpRect.width() >= 0.9f * W && tmpRect.height() >= 0.6f * H;
+              }
+          
+              /** 按类名找到首页视频流的翻页控件（RTViewPager） */
+              private static View findFeedPager(View v, int W, int H) {
+                  if (v.getVisibility() != View.VISIBLE) return null;
+                  if (PAGER_CLASS.equals(v.getClass().getName()) && isFeedVisible(v, W, H)) return v;
+                  if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) {
+                          View r = findFeedPager(g.getChildAt(i), W, H);
+                          if (r != null) return r;
+                      }
+                  }
+                  return null;
+              }
+          
+              /** 找到贴着屏幕底边、通栏、高度约等于缺口的视图，即底部标签栏（跳过视频流自身） */
+              private static View findBar(View root, View skip, int W, int H, int gap) {
+                  View[] best = new View[1];
+                  int[] bestDepth = {Integer.MAX_VALUE};
+                  scanBar(root, skip, W, H, gap, 0, best, bestDepth);
+                  return best[0];
+              }
+          
+              private static void scanBar(View v, View skip, int W, int H, int gap, int depth,
+                                          View[] best, int[] bestDepth) {
+                  if (v == skip || v.getVisibility() != View.VISIBLE || depth >= bestDepth[0]) return;
+                  int h = v.getHeight();
+                  if (h >= gap - 8 && h <= gap + 40 && v.getWidth() >= 0.9f * W) {
+                      v.getLocationInWindow(tmpLoc);
+                      if (tmpLoc[1] + h >= H - 3) {
+                          best[0] = v;
+                          bestDepth[0] = depth;
+                          return;
+                      }
+                  }
+                  if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) {
+                          scanBar(g.getChildAt(i), skip, W, H, gap, depth + 1, best, bestDepth);
+                      }
+                  }
+              }
+          
+              // ================= 配置 =================
+          
+              private static void loadCfg(Context c) {
+                  if (cfgLoaded) return;
+                  cfgLoaded = true;
+                  try {
+                      SharedPreferences sp = c.getSharedPreferences(PREF, 0);
+                      fullscreen = sp.getBoolean("fullscreen", true);
+                      barTransparent = sp.getBoolean("barTransparent", true);
+                  } catch (Throwable ignored) { }
+              }
+          
+              private static void saveCfg(Context c) {
+                  try {
+                      c.getSharedPreferences(PREF, 0).edit()
+                              .putBoolean("fullscreen", fullscreen)
+                              .putBoolean("barTransparent", barTransparent)
+                              .apply();
+                  } catch (Throwable ignored) { }
+              }
+          
+              // ================= 设置页入口 =================
+          
+              private static void collectMarkers(View v, boolean[] found) {
+                  if (v.getVisibility() != View.VISIBLE) return;
+                  if (v instanceof TextView) {
+                      CharSequence t = ((TextView) v).getText();
+                      if (t != null) {
+                          String x = t.toString().trim();
+                          for (int i = 0; i < MARKERS.length; i++) {
+                              if (x.equals(MARKERS[i])) found[i] = true;
+                          }
+                      }
+                  }
+                  if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) collectMarkers(g.getChildAt(i), found);
+                  }
+              }
+          
+              private static boolean isSettingsPage(View root) {
+                  boolean[] found = new boolean[MARKERS.length];
+                  collectMarkers(root, found);
+                  int n = 0;
+                  for (boolean f : found) if (f) n++;
+                  return n >= 2;
+              }
+          
+              private static void scheduleEntryCheck(final Activity a) {
+                  View decor = a.getWindow().getDecorView();
+                  if (!(decor instanceof FrameLayout)) return;
+                  final FrameLayout fl = (FrameLayout) decor;
+                  if (fl.findViewWithTag(ENTRY_TAG) != null) return;
+                  final int[] tries = {0};
+                  fl.postDelayed(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              if (a.isFinishing() || fl.findViewWithTag(ENTRY_TAG) != null) return;
+                              if (isSettingsPage(fl)) {
+                                  addEntry(a, fl);
+                                  return;
+                              }
+                          } catch (Throwable ignored) { }
+                          if (++tries[0] < 4) fl.postDelayed(this, 600);
+                      }
+                  }, 400);
+              }
+          
+              private static int dp(Context c, int v) {
+                  return (int) (v * c.getResources().getDisplayMetrics().density + 0.5f);
+              }
+          
+              private static void addEntry(final Activity a, FrameLayout fl) {
+                  TextView bar = new TextView(a);
+                  bar.setTag(ENTRY_TAG);
+                  bar.setText("全屏设置  ›");
+                  bar.setTextColor(Color.WHITE);
+                  bar.setTextSize(15);
+                  bar.setGravity(Gravity.CENTER);
+                  bar.setPadding(dp(a, 24), dp(a, 11), dp(a, 24), dp(a, 11));
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setColor(0xEE18A058);
+                  bg.setCornerRadius(dp(a, 24));
+                  bar.setBackground(bg);
+                  bar.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) { showMenu(a); }
+                  });
+                  FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+                  lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                  lp.bottomMargin = dp(a, 120); // 在「弹簧动画设置」按钮上方，避免重叠
+                  fl.addView(bar, lp);
+              }
+          
+              // ================= 设置面板 =================
+          
+              private static void addSwitch(Activity a, LinearLayout root, String text, boolean checked,
+                                            CompoundButton.OnCheckedChangeListener l) {
+                  Switch sw = new Switch(a);
+                  sw.setText(text);
+                  sw.setTextColor(0xFF222222);
+                  sw.setChecked(checked);
+                  sw.setPadding(0, dp(a, 14), 0, 0);
+                  sw.setOnCheckedChangeListener(l);
+                  root.addView(sw);
+              }
+          
+              private static void showMenu(final Activity a) {
+                  if (menuShowing) return;
+                  try {
+                      final Dialog d = new Dialog(a);
+                      d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+          
+                      LinearLayout root = new LinearLayout(a);
+                      root.setOrientation(LinearLayout.VERTICAL);
+                      root.setPadding(dp(a, 20), dp(a, 18), dp(a, 20), dp(a, 8));
+                      GradientDrawable bg = new GradientDrawable();
+                      bg.setColor(0xFFFFFFFF);
+                      bg.setCornerRadius(dp(a, 16));
+                      root.setBackground(bg);
+          
+                      TextView title = new TextView(a);
+                      title.setText("抖音全屏设置");
+                      title.setTextColor(0xFF222222);
+                      title.setTextSize(18);
+                      title.setTypeface(null, Typeface.BOLD);
+                      root.addView(title);
+          
+                      addSwitch(a, root, "全屏铺满（视频延伸到屏幕底部）", fullscreen,
+                              new CompoundButton.OnCheckedChangeListener() {
+                                  @Override
+                                  public void onCheckedChanged(CompoundButton b, boolean c) {
+                                      fullscreen = c;
+                                      saveCfg(a);
+                                  }
+                              });
+                      addSwitch(a, root, "底栏透明（点击底部位置仍可切换标签）", barTransparent,
+                              new CompoundButton.OnCheckedChangeListener() {
+                                  @Override
+                                  public void onCheckedChanged(CompoundButton b, boolean c) {
+                                      barTransparent = c;
+                                      saveCfg(a);
+                                  }
+                              });
+          
+                      TextView tip = new TextView(a);
+                      tip.setText("回到首页即生效。使用本模块时，请关闭其他模块里的全屏、隐藏底栏等功能，避免互相冲突。");
+                      tip.setTextColor(0xFF888888);
+                      tip.setTextSize(12);
+                      tip.setPadding(0, dp(a, 14), 0, 0);
+                      root.addView(tip);
+          
+                      TextView close = new TextView(a);
+                      close.setText("关闭");
+                      close.setTextColor(0xFF1A5CFF);
+                      close.setTextSize(15);
+                      close.setGravity(Gravity.CENTER);
+                      close.setPadding(0, dp(a, 14), 0, dp(a, 10));
+                      close.setOnClickListener(new View.OnClickListener() {
+                          @Override
+                          public void onClick(View v) { d.dismiss(); }
+                      });
+                      root.addView(close, new LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+          
+                      d.setContentView(root);
+                      d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                      d.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                          @Override
+                          public void onDismiss(android.content.DialogInterface di) { menuShowing = false; }
+                      });
+                      menuShowing = true;
+                      d.show();
+          
+                      WindowManager.LayoutParams wl = new WindowManager.LayoutParams();
+                      wl.copyFrom(d.getWindow().getAttributes());
+                      wl.width = (int) (a.getResources().getDisplayMetrics().widthPixels * 0.88f);
+                      d.getWindow().setAttributes(wl);
+                  } catch (Throwable t) {
+                      menuShowing = false;
+                      XposedBridge.log(TAG + "showMenu 失败: " + t);
+                  }
+              }
+          }
+          EOF_X
+      - name: Build
+        working-directory: proj2
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DouyinFullscreen-apk
+          path: proj2/app/build/outputs/apk/debug/app-debug.apk
