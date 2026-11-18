@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '1.1'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -98,12 +98,14 @@ jobs:
           import android.graphics.Rect;
           import android.graphics.Typeface;
           import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.Drawable;
           import android.graphics.drawable.GradientDrawable;
           import android.os.Build;
           import android.os.SystemClock;
           import android.view.Gravity;
           import android.view.View;
           import android.view.ViewGroup;
+          import android.view.ViewParent;
           import android.view.ViewTreeObserver;
           import android.view.Window;
           import android.view.WindowManager;
@@ -114,6 +116,7 @@ jobs:
           import android.widget.TextView;
           
           import java.lang.ref.WeakReference;
+          import java.util.ArrayList;
           
           import de.robv.android.xposed.IXposedHookLoadPackage;
           import de.robv.android.xposed.XC_MethodHook;
@@ -136,8 +139,11 @@ jobs:
               private static final String PAGER_CLASS = "com.ss.android.ugc.aweme.common.widget.RTViewPager";
               private static final String[] MARKERS = {"账号与安全", "隐私设置", "通用设置"};
           
+              private static final int UNSET = Integer.MIN_VALUE;
+          
               private static volatile boolean fullscreen = true;
               private static volatile boolean barTransparent = true;
+              private static volatile boolean barHide = false;
               private static boolean cfgLoaded = false;
               private static boolean menuShowing = false;
           
@@ -151,11 +157,24 @@ jobs:
               private static long lastBarScan = 0;
               private static long lastCancel = 0;
               private static int cancels = 0;
-              private static int origMargin = Integer.MIN_VALUE;
+              private static int heightTries = 0;
+              private static int strategy = 0; // 0 = 改下边距，1 = 改固定高度
+              private static int origMargin = UNSET;
+              private static int origHeight = UNSET;
+              private static int lastGap = UNSET;
               private static int barGap = 0;
               private static boolean failed = false;
-              private static boolean barHidden = false;
+              private static boolean extended = false;
+              private static int barMode = 0; // 0 = 未处理，1 = 背景透明，2 = 完全隐藏
               private static float barOrigAlpha = 1f;
+              private static final ArrayList<WeakReference<View>> bgViews = new ArrayList<>();
+              private static final ArrayList<Drawable> bgSaved = new ArrayList<>();
+          
+              // ---- 状态说明（显示在设置面板里，方便排查）----
+              private static String diagPager = "尚未进入首页";
+              private static String diagGap = "-";
+              private static String diagFix = "-";
+              private static String diagBar = "-";
           
               @Override
               public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -190,10 +209,8 @@ jobs:
                   listenerDecor = new WeakReference<View>(decor);
                   pagerRef = null;
                   barRef = null;
-                  failed = false;
-                  barHidden = false;
-                  origMargin = Integer.MIN_VALUE;
-                  cancels = 0;
+                  barMode = 0;
+                  resetState();
           
                   if (fullscreen) makeNavBarTransparent(a);
           
@@ -220,6 +237,17 @@ jobs:
                   } catch (Throwable ignored) { }
               }
           
+              private static void resetState() {
+                  failed = false;
+                  strategy = 0;
+                  origMargin = UNSET;
+                  origHeight = UNSET;
+                  cancels = 0;
+                  heightTries = 0;
+                  extended = false;
+                  lastGap = UNSET;
+              }
+          
               /** 每帧绘制前调用：返回 true 表示改动了布局，需要取消本帧绘制并重新布局 */
               private static boolean feedFix(View decor) {
                   int W = decor.getWidth();
@@ -236,92 +264,118 @@ jobs:
                           View found = findFeedPager(decor, W, H);
                           if (found != pager) {
                               pagerRef = found == null ? null : new WeakReference<View>(found);
-                              barRef = null;
-                              failed = false;
-                              origMargin = Integer.MIN_VALUE;
-                              cancels = 0;
+                              resetState();
+                              diagPager = found == null ? "未找到（不在首页，或控件类名已变化）"
+                                      : "已找到 " + found.getWidth() + "x" + found.getHeight();
                           }
                       }
                       return false;
                   }
           
-                  if (!fullscreen) {
-                      revertMargin(pager);
-                      restoreBar();
-                      return false;
-                  }
-          
-                  pager.getLocationInWindow(tmpLoc);
-                  int gap = H - (tmpLoc[1] + pager.getHeight());
                   boolean relayout = false;
-          
-                  if (!failed && gap >= 0.02f * H && gap <= 0.10f * H) {
-                      if (cancels >= 3 && now - lastCancel < 2000) {
-                          // 连续多次调整仍未生效：本轮放行，避免死循环
-                      } else {
-                          if (cancels >= 3) cancels = 0;
-                          ViewGroup.LayoutParams lp = pager.getLayoutParams();
-                          if (lp instanceof ViewGroup.MarginLayoutParams) {
-                              ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-                              if (origMargin == Integer.MIN_VALUE) origMargin = m.bottomMargin;
-                              if (origMargin - (m.bottomMargin - gap) > 0.12f * H) {
-                                  // 累计调整过大，说明这个布局不吃这种调整：放弃并还原
-                                  failed = true;
-                                  m.bottomMargin = origMargin;
-                                  pager.setLayoutParams(m);
-                              } else {
-                                  if (barGap == 0) barGap = gap;
-                                  m.bottomMargin -= gap;
-                                  pager.setLayoutParams(m);
-                                  cancels++;
-                                  lastCancel = now;
-                                  relayout = true;
-                              }
-                          } else {
-                              failed = true;
-                          }
-                      }
-                  } else if (gap < 2) {
-                      cancels = 0;
-                  }
-          
-                  if (barTransparent && barGap > 0) {
-                      View bar = barRef != null ? barRef.get() : null;
-                      if ((bar == null || bar.getWindowToken() == null) && now - lastBarScan >= 500) {
-                          lastBarScan = now;
-                          bar = findBar(decor, pager, W, H, barGap);
-                          barRef = bar == null ? null : new WeakReference<View>(bar);
-                          barHidden = false;
-                      }
-                      if (bar != null && bar.getWindowToken() != null) {
-                          if (!barHidden) {
-                              barOrigAlpha = bar.getAlpha();
-                              barHidden = true;
-                          }
-                          if (bar.getAlpha() != 0f) bar.setAlpha(0f);
-                      }
-                  } else {
-                      restoreBar();
-                  }
+                  if (fullscreen) relayout = extend(pager, H, now);
+                  else revertExtend(pager);
+                  applyBar(decor, pager, W, H, now);
                   return relayout;
               }
           
-              private static void revertMargin(View pager) {
-                  if (origMargin == Integer.MIN_VALUE) return;
-                  ViewGroup.LayoutParams lp = pager.getLayoutParams();
-                  if (lp instanceof ViewGroup.MarginLayoutParams) {
-                      ((ViewGroup.MarginLayoutParams) lp).bottomMargin = origMargin;
-                      pager.setLayoutParams(lp);
+              /** 把视频流向下延伸到屏幕底边；先尝试改下边距，无效再改成固定高度 */
+              private static boolean extend(View pager, int H, long now) {
+                  pager.getLocationInWindow(tmpLoc);
+                  int gap = H - (tmpLoc[1] + pager.getHeight());
+                  if (gap != lastGap) {
+                      lastGap = gap;
+                      diagGap = gap + " px（窗口高 " + H + "）";
                   }
-                  origMargin = Integer.MIN_VALUE;
-                  cancels = 0;
+                  if (gap >= 0.02f * H && gap <= 0.10f * H) barGap = gap;
+                  if (gap < 2) {
+                      cancels = 0;
+                      heightTries = 0;
+                      diagFix = extended ? "已铺满（" + (strategy == 0 ? "边距法" : "定高法") + "）"
+                              : "无需调整（已经铺满）";
+                      return false;
+                  }
+                  if (failed || gap < 0.02f * H || gap > 0.10f * H) return false;
+                  if (cancels >= 3 && now - lastCancel < 2000) return false; // 防止死循环
+                  if (cancels >= 3) cancels = 0;
+          
+                  ViewGroup.LayoutParams lp = pager.getLayoutParams();
+                  if (lp == null) {
+                      failed = true;
+                      diagFix = "失败：视频流没有布局参数";
+                      return false;
+                  }
+                  if (origHeight == UNSET) origHeight = lp.height;
+                  if (origMargin == UNSET && lp instanceof ViewGroup.MarginLayoutParams) {
+                      origMargin = ((ViewGroup.MarginLayoutParams) lp).bottomMargin;
+                  }
+          
+                  if (strategy == 0) {
+                      if (!(lp instanceof ViewGroup.MarginLayoutParams) || origMargin == UNSET) {
+                          strategy = 1;
+                          return false;
+                      }
+                      ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
+                      if (origMargin - (m.bottomMargin - gap) > 0.12f * H) {
+                          // 累计调整过大，说明边距不起作用：还原并改用定高法
+                          m.bottomMargin = origMargin;
+                          strategy = 1;
+                          cancels = 0;
+                          pager.setLayoutParams(m);
+                          diagFix = "边距法无效，改用定高法";
+                      } else {
+                          m.bottomMargin -= gap;
+                          pager.setLayoutParams(m);
+                          diagFix = "边距法调整中";
+                      }
+                  } else {
+                      if (heightTries >= 3) {
+                          failed = true;
+                          restoreLp(pager);
+                          diagFix = "失败：布局不响应调整（视频流布局：" + describeLp(lp) + "）";
+                          return true;
+                      }
+                      heightTries++;
+                      lp.height = pager.getHeight() + gap;
+                      pager.setLayoutParams(lp);
+                      diagFix = "定高法调整中";
+                  }
+                  extended = true;
+                  cancels++;
+                  lastCancel = now;
+                  return true;
               }
           
-              private static void restoreBar() {
-                  if (!barHidden) return;
-                  barHidden = false;
-                  View bar = barRef != null ? barRef.get() : null;
-                  if (bar != null) bar.setAlpha(barOrigAlpha);
+              private static void restoreLp(View pager) {
+                  ViewGroup.LayoutParams lp = pager.getLayoutParams();
+                  if (lp == null) return;
+                  if (origHeight != UNSET) lp.height = origHeight;
+                  if (origMargin != UNSET && lp instanceof ViewGroup.MarginLayoutParams) {
+                      ((ViewGroup.MarginLayoutParams) lp).bottomMargin = origMargin;
+                  }
+                  pager.setLayoutParams(lp);
+              }
+          
+              private static void revertExtend(View pager) {
+                  if (!extended) return;
+                  restoreLp(pager);
+                  resetState();
+                  diagFix = "已关闭";
+              }
+          
+              private static String describeLp(ViewGroup.LayoutParams lp) {
+                  String n = lp.getClass().getName();
+                  n = n.substring(n.lastIndexOf('.') + 1);
+                  String r = n + " h=" + lp.height;
+                  if (lp instanceof ViewGroup.MarginLayoutParams) {
+                      r += " 下边距=" + ((ViewGroup.MarginLayoutParams) lp).bottomMargin;
+                  }
+                  return r;
+              }
+          
+              private static String shortName(View v) {
+                  String n = v.getClass().getName();
+                  return n.substring(n.lastIndexOf('.') + 1);
               }
           
               private static boolean isFeedVisible(View pager, int W, int H) {
@@ -344,12 +398,133 @@ jobs:
                   return null;
               }
           
-              /** 找到贴着屏幕底边、通栏、高度约等于缺口的视图，即底部标签栏（跳过视频流自身） */
-              private static View findBar(View root, View skip, int W, int H, int gap) {
-                  View[] best = new View[1];
-                  int[] bestDepth = {Integer.MAX_VALUE};
-                  scanBar(root, skip, W, H, gap, 0, best, bestDepth);
-                  return best[0];
+              // ================= 底栏 =================
+          
+              private static void applyBar(View decor, View pager, int W, int H, long now) {
+                  int want = barHide ? 2 : (barTransparent ? 1 : 0);
+                  if (want != barMode) restoreBar();
+                  if (want == 0) return;
+          
+                  View bar = barRef != null ? barRef.get() : null;
+                  if (bar == null || bar.getWindowToken() == null) {
+                      if (now - lastBarScan < 500) return;
+                      lastBarScan = now;
+                      bar = findBar(decor, pager, W, H);
+                      if (bar == null) {
+                          diagBar = "未找到底栏";
+                          return;
+                      }
+                      barRef = new WeakReference<View>(bar);
+                      barMode = 0;
+                      diagBar = "已找到 " + shortName(bar) + " " + bar.getWidth() + "x" + bar.getHeight();
+                  }
+          
+                  if (want == 2) {
+                      if (barMode != 2) {
+                          barOrigAlpha = bar.getAlpha();
+                          barMode = 2;
+                      }
+                      if (bar.getAlpha() != 0f) bar.setAlpha(0f);
+                  } else {
+                      if (barMode != 1) {
+                          bgViews.clear();
+                          bgSaved.clear();
+                          collectBg(bar, 0);
+                          ViewParent pp = bar.getParent();
+                          if (pp instanceof ViewGroup) {
+                              ViewGroup g = (ViewGroup) pp;
+                              for (int i = 0; i < g.getChildCount(); i++) {
+                                  View c = g.getChildAt(i);
+                                  if (c == bar || c == pager || c.getVisibility() != View.VISIBLE) continue;
+                                  c.getLocationInWindow(tmpLoc);
+                                  if (c.getWidth() >= 0.9f * W && c.getHeight() <= 0.2f * H
+                                          && tmpLoc[1] + c.getHeight() >= H - 3) {
+                                      collectBg(c, 0);
+                                  }
+                              }
+                          }
+                          barMode = 1;
+                      }
+                      for (int i = 0; i < bgViews.size(); i++) {
+                          View v = bgViews.get(i).get();
+                          if (v != null && v.getBackground() != null) v.setBackground(null);
+                      }
+                  }
+              }
+          
+              private static void collectBg(View v, int depth) {
+                  Drawable d = v.getBackground();
+                  if (d != null) {
+                      bgViews.add(new WeakReference<View>(v));
+                      bgSaved.add(d);
+                  }
+                  if (depth < 3 && v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) collectBg(g.getChildAt(i), depth + 1);
+                  }
+              }
+          
+              private static void restoreBar() {
+                  if (barMode == 0) return;
+                  View bar = barRef != null ? barRef.get() : null;
+                  if (barMode == 2) {
+                      if (bar != null) bar.setAlpha(barOrigAlpha);
+                  } else if (barMode == 1) {
+                      for (int i = 0; i < bgViews.size(); i++) {
+                          View v = bgViews.get(i).get();
+                          if (v != null) v.setBackground(bgSaved.get(i));
+                      }
+                      bgViews.clear();
+                      bgSaved.clear();
+                  }
+                  barMode = 0;
+              }
+          
+              /** 先按底部标签文字（首页/消息/我）找，再向上找包住它的通栏容器；找不到再按几何特征找 */
+              private static View findBar(View decor, View pager, int W, int H) {
+                  View tab = findTabText(decor, pager, H);
+                  if (tab != null) {
+                      View best = null;
+                      View p = tab;
+                      while (p != null) {
+                          int h = p.getHeight();
+                          if (h > 0.2f * H) break;
+                          p.getLocationInWindow(tmpLoc);
+                          if (p.getWidth() >= 0.9f * W && tmpLoc[1] + h >= H - 3) best = p;
+                          ViewParent pp = p.getParent();
+                          p = pp instanceof View ? (View) pp : null;
+                      }
+                      if (best != null) return best;
+                  }
+                  if (barGap > 0) {
+                      View[] best = new View[1];
+                      int[] bestDepth = {Integer.MAX_VALUE};
+                      scanBar(decor, pager, W, H, barGap, 0, best, bestDepth);
+                      return best[0];
+                  }
+                  return null;
+              }
+          
+              private static View findTabText(View v, View skip, int H) {
+                  if (v == skip || v.getVisibility() != View.VISIBLE) return null;
+                  if (v instanceof TextView) {
+                      CharSequence t = ((TextView) v).getText();
+                      if (t != null) {
+                          String x = t.toString().trim();
+                          if (x.equals("首页") || x.equals("消息") || x.equals("我")) {
+                              v.getLocationInWindow(tmpLoc);
+                              if (tmpLoc[1] >= 0.8f * H) return v;
+                          }
+                      }
+                  }
+                  if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) {
+                          View r = findTabText(g.getChildAt(i), skip, H);
+                          if (r != null) return r;
+                      }
+                  }
+                  return null;
               }
           
               private static void scanBar(View v, View skip, int W, int H, int gap, int depth,
@@ -381,6 +556,7 @@ jobs:
                       SharedPreferences sp = c.getSharedPreferences(PREF, 0);
                       fullscreen = sp.getBoolean("fullscreen", true);
                       barTransparent = sp.getBoolean("barTransparent", true);
+                      barHide = sp.getBoolean("barHide", false);
                   } catch (Throwable ignored) { }
               }
           
@@ -389,6 +565,7 @@ jobs:
                       c.getSharedPreferences(PREF, 0).edit()
                               .putBoolean("fullscreen", fullscreen)
                               .putBoolean("barTransparent", barTransparent)
+                              .putBoolean("barHide", barHide)
                               .apply();
                   } catch (Throwable ignored) { }
               }
@@ -510,7 +687,7 @@ jobs:
                                       saveCfg(a);
                                   }
                               });
-                      addSwitch(a, root, "底栏透明（点击底部位置仍可切换标签）", barTransparent,
+                      addSwitch(a, root, "底栏背景透明（保留图标，视频显示在下方）", barTransparent,
                               new CompoundButton.OnCheckedChangeListener() {
                                   @Override
                                   public void onCheckedChanged(CompoundButton b, boolean c) {
@@ -518,9 +695,22 @@ jobs:
                                       saveCfg(a);
                                   }
                               });
+                      addSwitch(a, root, "底栏完全隐藏（图标也不显示，位置仍可点击）", barHide,
+                              new CompoundButton.OnCheckedChangeListener() {
+                                  @Override
+                                  public void onCheckedChanged(CompoundButton b, boolean c) {
+                                      barHide = c;
+                                      saveCfg(a);
+                                  }
+                              });
           
                       TextView tip = new TextView(a);
-                      tip.setText("回到首页即生效。使用本模块时，请关闭其他模块里的全屏、隐藏底栏等功能，避免互相冲突。");
+                      tip.setText("回到首页即生效。使用本模块时，请关闭其他模块里的全屏、隐藏底栏等功能，避免互相冲突。"
+                              + "\n\n【状态】（效果不对时请截图本面板）"
+                              + "\n视频流：" + diagPager
+                              + "\n底部缺口：" + diagGap
+                              + "\n铺满：" + diagFix
+                              + "\n底栏：" + diagBar);
                       tip.setTextColor(0xFF888888);
                       tip.setTextSize(12);
                       tip.setPadding(0, dp(a, 14), 0, 0);
