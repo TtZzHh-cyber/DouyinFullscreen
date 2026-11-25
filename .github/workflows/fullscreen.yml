@@ -166,7 +166,8 @@ jobs:
               private static boolean failed = false;
               private static boolean extended = false;
               private static int barMode = 0; // 0 = 未处理，1 = 背景透明，2 = 完全隐藏
-              private static final ArrayList<WeakReference<View>> barViews = new ArrayList<>();
+              private static final ArrayList<WeakReference<View>> bars = new ArrayList<>();
+              private static int barGap = 0;
               private static final ArrayList<Float> barAlphas = new ArrayList<>();
               private static final ArrayList<WeakReference<View>> bgViews = new ArrayList<>();
               private static final ArrayList<Drawable> bgSaved = new ArrayList<>();
