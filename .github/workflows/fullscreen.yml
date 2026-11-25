@@ -282,7 +282,7 @@ jobs:
                       // 不在首页视频流（或视频流还没出现）：恢复底栏，并低频重新寻找视频流
                       inFeed = false;
                       // 短暂不可见（换视频、刷新）时不恢复底栏，避免底部闪一下；持续不在首页才恢复
-                      if (now - lastVisibleTime > 600) {
+                      if (now - lastVisibleTime > 2500) {
                           restoreBar();
                           resetCover();
                       }
@@ -566,7 +566,7 @@ jobs:
                   }
                   if (!alive) {
                       // 底栏被抖音重建时立即重新寻找（连续多次找不到才降频），避免底栏闪出来
-                      if (scanMiss >= 15 && now - lastBarScan < 500) return;
+                      if (scanMiss >= 15 && now - lastBarScan < 100) return;
                       lastBarScan = now;
                       bars.clear();
                       barAlphas.clear();
