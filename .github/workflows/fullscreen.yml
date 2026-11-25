@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 3
-                  versionName '1.2'
+                  versionCode 4
+                  versionName '1.3'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -119,6 +119,8 @@ jobs:
           import java.lang.ref.WeakReference;
           import java.util.ArrayList;
           import java.util.Locale;
+          import java.util.Map;
+          import java.util.WeakHashMap;
           
           import de.robv.android.xposed.IXposedHookLoadPackage;
           import de.robv.android.xposed.XC_MethodHook;
@@ -143,7 +145,8 @@ jobs:
           
               private static final int UNSET = Integer.MIN_VALUE;
           
-              private static volatile boolean fullscreen = true;
+              private static volatile boolean fullscreen = false;
+              private static volatile boolean coverVideo = true;
               private static volatile boolean barTransparent = true;
               private static volatile boolean barHide = false;
               private static boolean cfgLoaded = false;
@@ -164,6 +167,12 @@ jobs:
               private static int origHeight = UNSET;
               private static int lastGap = UNSET;
               private static boolean failed = false;
+              private static boolean unclipped = false;
+              private static long lastVisibleTime = 0;
+              private static long lastPartScan = 0;
+              private static int scanMiss = 0;
+              private static final WeakHashMap<View, View[]> itemParts = new WeakHashMap<>();
+              private static final WeakHashMap<View, Float> touched = new WeakHashMap<>();
               private static boolean extended = false;
               private static int barMode = 0; // 0 = 未处理，1 = 背景透明，2 = 完全隐藏
               private static final ArrayList<WeakReference<View>> bars = new ArrayList<>();
@@ -177,6 +186,7 @@ jobs:
               private static String diagGap = "-";
               private static String diagFix = "-";
               private static String diagBar = "-";
+              private static String diagCover = "-";
               private static String diagBarState = "-";
               private static String diagErr = "无";
               private static String lastPagerInfo = null;
@@ -256,6 +266,7 @@ jobs:
                   heightTries = 0;
                   extended = false;
                   lastGap = UNSET;
+                  unclipped = false;
               }
           
               /** 每帧绘制前调用：返回 true 表示改动了布局，需要取消本帧绘制并重新布局 */
@@ -270,7 +281,11 @@ jobs:
                   if (pager == null || pager.getWindowToken() == null || !isFeedVisible(pager, W, H)) {
                       // 不在首页视频流（或视频流还没出现）：恢复底栏，并低频重新寻找视频流
                       inFeed = false;
-                      restoreBar();
+                      // 短暂不可见（换视频、刷新）时不恢复底栏，避免底部闪一下；持续不在首页才恢复
+                      if (now - lastVisibleTime > 600) {
+                          restoreBar();
+                          resetCover();
+                      }
                       if (now - lastScan >= 500) {
                           lastScan = now;
                           View found = findFeedPager(decor, W, H);
@@ -286,10 +301,13 @@ jobs:
                   }
           
                   inFeed = true;
+                  lastVisibleTime = now;
                   visibleCount++;
                   boolean relayout = false;
                   if (fullscreen) relayout = extend(pager, H, now);
                   else revertExtend(pager);
+                  if (coverVideo) applyCover(pager, H, now);
+                  else resetCover();
                   applyBar(decor, pager, W, H, now);
                   return relayout;
               }
@@ -412,6 +430,128 @@ jobs:
                   return null;
               }
           
+              // ================= 画面铺满（只放大视频，文案和按钮不动） =================
+          
+              private static View findPart(View v, String suffix, int depth) {
+                  if (v.getClass().getName().endsWith(suffix)) return v;
+                  if (depth <= 0 || !(v instanceof ViewGroup)) return null;
+                  ViewGroup g = (ViewGroup) v;
+                  for (int i = 0; i < g.getChildCount(); i++) {
+                      View r = findPart(g.getChildAt(i), suffix, depth - 1);
+                      if (r != null) return r;
+                  }
+                  return null;
+              }
+          
+              private static void unclipUp(View from, View stop) {
+                  ViewParent p = from.getParent();
+                  while (p instanceof ViewGroup) {
+                      ((ViewGroup) p).setClipChildren(false);
+                      if (p == stop) break;
+                      p = p.getParent();
+                  }
+              }
+          
+              /**
+               * 只对视频画面（VideoPinchViewContainer 及封面）做缩放，让竖屏视频铺满到屏幕底部；
+               * 文案、按钮、进度条等不做任何改动，所以位置完全不变。
+               */
+              private static void applyCover(View pager, int H, long now) {
+                  if (!(pager instanceof ViewGroup)) return;
+                  ViewGroup pg = (ViewGroup) pager;
+                  pager.getLocationInWindow(tmpLoc);
+                  int gapPx = H - (tmpLoc[1] + pager.getHeight());
+                  int gap = (gapPx >= 2 && gapPx <= 0.10f * H) ? gapPx : 0;
+                  if (gap > 0 && !unclipped) {
+                      pg.setClipChildren(false);
+                      unclipUp(pager, null);
+                      unclipped = true;
+                  }
+          
+                  int handled = 0;
+                  float shown = 1f;
+                  String why = "页面里没有找到视频画面控件";
+                  for (int i = 0; i < pg.getChildCount(); i++) {
+                      View item = pg.getChildAt(i);
+                      if (item.getWidth() <= 0 || item.getHeight() <= 0) continue;
+          
+                      View[] parts = itemParts.get(item);
+                      if (parts == null || parts[0] == null || parts[1] == null) {
+                          if (parts == null || now - lastPartScan >= 250) {
+                              lastPartScan = now;
+                              View c = parts != null && parts[0] != null ? parts[0]
+                                      : findPart(item, ".VideoPinchViewContainer", 4);
+                              View cv = findPart(item, ".CoverImageView", 9);
+                              parts = new View[] {c, cv};
+                              itemParts.put(item, parts);
+                              if (item instanceof ViewGroup) ((ViewGroup) item).setClipChildren(false);
+                              if (c != null) unclipUp(c, item);
+                          }
+                      }
+                      View container = parts == null ? null : parts[0];
+                      View cover = parts == null ? null : parts[1];
+                      if (container == null) continue;
+                      if (!(container instanceof ViewGroup) || ((ViewGroup) container).getChildCount() == 0) {
+                          why = "视频画面控件里没有内容";
+                          continue;
+                      }
+                      View inner = ((ViewGroup) container).getChildAt(0);
+                      int iw = inner.getWidth();
+                      int ih = inner.getHeight();
+                      int rw = item.getWidth();
+                      int rh = item.getHeight();
+          
+                      float s = 1f;
+                      float ty = 0f;
+                      if (iw > 0 && ih > 0 && iw < ih * 0.9f) { // 只处理竖屏视频，横屏视频保持原样
+                          float want = Math.max((float) rw / iw, (rh + gap) / (float) ih);
+                          if (want > 1.01f && want <= 1.35f) {
+                              s = want;
+                              ty = gap / 2f;
+                              why = "已放大";
+                          } else if (want > 1.35f) {
+                              why = "视频比例差异过大，未放大（需要 " + String.format(Locale.US, "%.2f", want) + " 倍）";
+                          } else {
+                              why = "视频已经铺满，无需放大";
+                          }
+                      } else {
+                          why = "横屏或方形视频，保持原样";
+                      }
+                      setCover(container, s, ty);
+                      if (cover != null) setCover(cover, s, ty);
+                      handled++;
+                      shown = s;
+                  }
+                  diagCover = handled + " 页，缩放 " + String.format(Locale.US, "%.2f", shown) + "，缺口 " + gap + "px（" + why + "）";
+              }
+          
+              private static void setCover(View v, float s, float ty) {
+                  Float prev = touched.get(v);
+                  float cur = v.getScaleX();
+                  if (cur != 1f && (prev == null || cur != prev)) return; // 别处（如双指缩放）正在改，不干预
+                  if (s == 1f && prev == null) return;
+                  if (cur != s) {
+                      v.setScaleX(s);
+                      v.setScaleY(s);
+                  }
+                  if (v.getTranslationY() != ty) v.setTranslationY(ty);
+                  touched.put(v, s);
+              }
+          
+              private static void resetCover() {
+                  if (touched.isEmpty()) return;
+                  for (Map.Entry<View, Float> e : touched.entrySet()) {
+                      View v = e.getKey();
+                      Float s = e.getValue();
+                      if (v != null && s != null && v.getScaleX() == s) {
+                          v.setScaleX(1f);
+                          v.setScaleY(1f);
+                          v.setTranslationY(0f);
+                      }
+                  }
+                  touched.clear();
+              }
+          
               // ================= 底栏 =================
           
               private static void applyBar(View decor, View pager, int W, int H, long now) {
@@ -425,7 +565,8 @@ jobs:
                       if (v == null || v.getWindowToken() == null) alive = false;
                   }
                   if (!alive) {
-                      if (now - lastBarScan < 500) return;
+                      // 底栏被抖音重建时立即重新寻找（连续多次找不到才降频），避免底栏闪出来
+                      if (scanMiss >= 15 && now - lastBarScan < 500) return;
                       lastBarScan = now;
                       bars.clear();
                       barAlphas.clear();
@@ -434,9 +575,11 @@ jobs:
                       barMode = 0;
                       findBars(decor, pager, W, H);
                       if (bars.isEmpty()) {
+                          scanMiss++;
                           diagBar = "未找到底栏";
                           return;
                       }
+                      scanMiss = 0;
                   }
           
                   applyCount++;
@@ -604,7 +747,8 @@ jobs:
                   cfgLoaded = true;
                   try {
                       SharedPreferences sp = c.getSharedPreferences(PREF, 0);
-                      fullscreen = sp.getBoolean("fullscreen", true);
+                      fullscreen = sp.getBoolean("fullscreen", false);
+                      coverVideo = sp.getBoolean("coverVideo", true);
                       barTransparent = sp.getBoolean("barTransparent", true);
                       barHide = sp.getBoolean("barHide", false);
                   } catch (Throwable ignored) { }
@@ -614,6 +758,7 @@ jobs:
                   try {
                       c.getSharedPreferences(PREF, 0).edit()
                               .putBoolean("fullscreen", fullscreen)
+                              .putBoolean("coverVideo", coverVideo)
                               .putBoolean("barTransparent", barTransparent)
                               .putBoolean("barHide", barHide)
                               .apply();
@@ -729,7 +874,15 @@ jobs:
                       title.setTypeface(null, Typeface.BOLD);
                       root.addView(title);
           
-                      addSwitch(a, root, "全屏铺满（视频延伸到屏幕底部）", fullscreen,
+                      addSwitch(a, root, "画面铺满（只放大视频，文案按钮位置不变）", coverVideo,
+                              new CompoundButton.OnCheckedChangeListener() {
+                                  @Override
+                                  public void onCheckedChanged(CompoundButton b, boolean c) {
+                                      coverVideo = c;
+                                      saveCfg(a);
+                                  }
+                              });
+                      addSwitch(a, root, "整体拉伸到底部（会改布局，文案会下移）", fullscreen,
                               new CompoundButton.OnCheckedChangeListener() {
                                   @Override
                                   public void onCheckedChanged(CompoundButton b, boolean c) {
@@ -760,7 +913,8 @@ jobs:
                               + "\n视频流：" + (lastPagerInfo == null ? "还没找到（控件类名可能已变化）"
                                       : lastPagerInfo + (inFeed ? "，首页中" : "，当前不在首页"))
                               + "\n底部缺口：" + diagGap
-                              + "\n铺满：" + diagFix
+                              + "\n画面铺满：" + diagCover
+                              + "\n布局拉伸：" + diagFix
                               + "\n底栏：" + diagBar
                               + "\n底栏处理：" + diagBarState
                               + "\n运行：回调 " + runCount + " 次，首页可见 " + visibleCount
