@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 6
-                  versionName '1.5'
+                  versionCode 7
+                  versionName '1.6'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -133,9 +133,10 @@ jobs:
            * 1. 把首页视频翻页控件（RTViewPager）向下延伸到屏幕底部；
            * 2. 底部标签栏设为透明（仍可点击）。
            *
-           * v1.5 修复：
-           * 1. 解决底栏透明后，滑动时下一个视频顶部画面闪烁的问题（不再移除底栏兄弟节点的渐变遮罩，改用 ColorDrawable.TRANSPARENT 替换背景防重绘闪烁）；
-           * 2. 解决画面放大时，预加载的下一页溢出到屏幕底部导致闪烁的问题（增加当前页判定，只放大当前页）。
+           * v1.6 修复：
+           * 1. 彻底解决底栏透明时，滑动画面闪烁：将底栏所有兄弟节点（底部黑色渐变遮罩）一并透明化；
+           * 2. 解决 pager 预加载页面漏边：不再修改 pager 本身的 setClipChildren，只在 item 内部放开裁剪；
+           * 3. 解决底栏变透明后背景被重置的问题：强制 setBackground(null)。
            */
           public class MainHook implements IXposedHookLoadPackage {
           
@@ -504,9 +505,9 @@ jobs:
                   pager.getLocationInWindow(tmpLoc);
                   int gapPx = H - (tmpLoc[1] + pager.getHeight());
                   int gap = (gapPx >= 2 && gapPx <= 0.10f * H) ? gapPx : 0;
+                  
+                  // ★ 关键修改：不再对 pager 设置 setClipChildren(false)，避免下一页漏出底部
                   if (gap > 0 && !unclipped) {
-                      pg.setClipChildren(false);
-                      unclipUp(pager, null);
                       unclipped = true;
                   }
           
@@ -533,6 +534,12 @@ jobs:
                               parts = new View[] {c, cv};
                               itemParts.put(item, parts);
                               if (item instanceof ViewGroup) ((ViewGroup) item).setClipChildren(false);
+                              // ★ 关键修改：只在 item 内部以及它的直接子容器放开裁剪，不涉及 pager 本身
+                              ViewParent p = item.getParent();
+                              while (p instanceof ViewGroup && p != pager) {
+                                  ((ViewGroup) p).setClipChildren(false);
+                                  p = p.getParent();
+                              }
                               if (c != null) unclipUp(c, item);
                           }
                       }
@@ -652,16 +659,32 @@ jobs:
                               View bar = bars.get(i).get();
                               if (bar == null) continue;
                               
-                              // ★ 修改1：只收集底栏自身的背景，不再清除兄弟节点（底部渐变遮罩），防止画面断层闪烁
+                              // ★ 关键修改1：收集底栏自身的背景
                               collectBg(bar, 0);
+                              
+                              // ★ 关键修改2：收集底栏的兄弟节点（底部渐变黑边遮罩），一并透明化
+                              ViewParent pp = bar.getParent();
+                              if (pp instanceof ViewGroup) {
+                                  ViewGroup g = (ViewGroup) pp;
+                                  for (int k = 0; k < g.getChildCount(); k++) {
+                                      View c = g.getChildAt(k);
+                                      if (c == bar || c == pager || c.getVisibility() != View.VISIBLE) continue;
+                                      c.getLocationInWindow(tmpLoc);
+                                      if (c.getWidth() >= 0.9f * W && c.getHeight() <= 0.2f * H
+                                              && tmpLoc[1] + c.getHeight() >= H - 3) {
+                                          collectBg(c, 0);
+                                      }
+                                  }
+                              }
                           }
                           barMode = 1;
                       }
                       for (int i = 0; i < bgViews.size(); i++) {
                           View v = bgViews.get(i).get();
-                          if (v != null && v.getBackground() != null) {
-                              // ★ 修改2：用透明 Drawable 替换，而不是 null，避免滑动重绘时闪烁
-                              v.setBackground(new ColorDrawable(Color.TRANSPARENT));
+                          if (v != null) {
+                              // ★ 关键修改3：强制清空背景和前景（同时设为 null，防止抖音重置）
+                              if (v.getBackground() != null) v.setBackground(null);
+                              if (v.getForeground() != null) v.setForeground(null);
                           }
                       }
                   }
