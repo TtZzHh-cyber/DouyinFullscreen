@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 2
-                  versionName '1.1'
+                  versionCode 3
+                  versionName '1.2'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -112,11 +112,13 @@ jobs:
           import android.widget.CompoundButton;
           import android.widget.FrameLayout;
           import android.widget.LinearLayout;
+          import android.widget.ScrollView;
           import android.widget.Switch;
           import android.widget.TextView;
           
           import java.lang.ref.WeakReference;
           import java.util.ArrayList;
+          import java.util.Locale;
           
           import de.robv.android.xposed.IXposedHookLoadPackage;
           import de.robv.android.xposed.XC_MethodHook;
@@ -150,7 +152,6 @@ jobs:
               // ---- 首页状态（仅在主线程使用）----
               private static WeakReference<View> listenerDecor;
               private static WeakReference<View> pagerRef;
-              private static WeakReference<View> barRef;
               private static final Rect tmpRect = new Rect();
               private static final int[] tmpLoc = new int[2];
               private static long lastScan = 0;
@@ -162,19 +163,26 @@ jobs:
               private static int origMargin = UNSET;
               private static int origHeight = UNSET;
               private static int lastGap = UNSET;
-              private static int barGap = 0;
               private static boolean failed = false;
               private static boolean extended = false;
               private static int barMode = 0; // 0 = 未处理，1 = 背景透明，2 = 完全隐藏
-              private static float barOrigAlpha = 1f;
+              private static final ArrayList<WeakReference<View>> barViews = new ArrayList<>();
+              private static final ArrayList<Float> barAlphas = new ArrayList<>();
               private static final ArrayList<WeakReference<View>> bgViews = new ArrayList<>();
               private static final ArrayList<Drawable> bgSaved = new ArrayList<>();
           
               // ---- 状态说明（显示在设置面板里，方便排查）----
-              private static String diagPager = "尚未进入首页";
+              private static String diagPager = "尚未进入首页（或控件类名已变化）";
               private static String diagGap = "-";
               private static String diagFix = "-";
               private static String diagBar = "-";
+              private static String diagBarState = "-";
+              private static String diagErr = "无";
+              private static String lastPagerInfo = null;
+              private static boolean inFeed = false;
+              private static int runCount = 0;
+              private static int visibleCount = 0;
+              private static int applyCount = 0;
           
               @Override
               public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -208,8 +216,7 @@ jobs:
                   if (listenerDecor != null && listenerDecor.get() == decor) return;
                   listenerDecor = new WeakReference<View>(decor);
                   pagerRef = null;
-                  barRef = null;
-                  barMode = 0;
+                  restoreBar();
                   resetState();
           
                   if (fullscreen) makeNavBarTransparent(a);
@@ -223,6 +230,8 @@ jobs:
                               // 返回 false 会取消本帧绘制并立即重新布局，使改动在同一帧生效，不会闪烁
                               return !feedFix(decor);
                           } catch (Throwable t) {
+                              StackTraceElement[] st = t.getStackTrace();
+                              diagErr = t + (st.length > 0 ? " @" + st[0].getMethodName() + ":" + st[0].getLineNumber() : "");
                               return true;
                           }
                       }
@@ -250,6 +259,7 @@ jobs:
           
               /** 每帧绘制前调用：返回 true 表示改动了布局，需要取消本帧绘制并重新布局 */
               private static boolean feedFix(View decor) {
+                  runCount++;
                   int W = decor.getWidth();
                   int H = decor.getHeight();
                   if (W <= 0 || H <= 0) return false;
@@ -258,6 +268,7 @@ jobs:
                   View pager = pagerRef != null ? pagerRef.get() : null;
                   if (pager == null || pager.getWindowToken() == null || !isFeedVisible(pager, W, H)) {
                       // 不在首页视频流（或视频流还没出现）：恢复底栏，并低频重新寻找视频流
+                      inFeed = false;
                       restoreBar();
                       if (now - lastScan >= 500) {
                           lastScan = now;
@@ -265,13 +276,16 @@ jobs:
                           if (found != pager) {
                               pagerRef = found == null ? null : new WeakReference<View>(found);
                               resetState();
-                              diagPager = found == null ? "未找到（不在首页，或控件类名已变化）"
-                                      : "已找到 " + found.getWidth() + "x" + found.getHeight();
+                              if (found != null) {
+                                  lastPagerInfo = shortName(found) + " " + found.getWidth() + "x" + found.getHeight();
+                              }
                           }
                       }
                       return false;
                   }
           
+                  inFeed = true;
+                  visibleCount++;
                   boolean relayout = false;
                   if (fullscreen) relayout = extend(pager, H, now);
                   else revertExtend(pager);
@@ -287,7 +301,6 @@ jobs:
                       lastGap = gap;
                       diagGap = gap + " px（窗口高 " + H + "）";
                   }
-                  if (gap >= 0.02f * H && gap <= 0.10f * H) barGap = gap;
                   if (gap < 2) {
                       cancels = 0;
                       heightTries = 0;
@@ -405,41 +418,59 @@ jobs:
                   if (want != barMode) restoreBar();
                   if (want == 0) return;
           
-                  View bar = barRef != null ? barRef.get() : null;
-                  if (bar == null || bar.getWindowToken() == null) {
+                  boolean alive = !bars.isEmpty();
+                  for (int i = 0; alive && i < bars.size(); i++) {
+                      View v = bars.get(i).get();
+                      if (v == null || v.getWindowToken() == null) alive = false;
+                  }
+                  if (!alive) {
                       if (now - lastBarScan < 500) return;
                       lastBarScan = now;
-                      bar = findBar(decor, pager, W, H);
-                      if (bar == null) {
+                      bars.clear();
+                      barAlphas.clear();
+                      bgViews.clear();
+                      bgSaved.clear();
+                      barMode = 0;
+                      findBars(decor, pager, W, H);
+                      if (bars.isEmpty()) {
                           diagBar = "未找到底栏";
                           return;
                       }
-                      barRef = new WeakReference<View>(bar);
-                      barMode = 0;
-                      diagBar = "已找到 " + shortName(bar) + " " + bar.getWidth() + "x" + bar.getHeight();
                   }
           
+                  applyCount++;
                   if (want == 2) {
                       if (barMode != 2) {
-                          barOrigAlpha = bar.getAlpha();
+                          barAlphas.clear();
+                          for (int i = 0; i < bars.size(); i++) {
+                              View v = bars.get(i).get();
+                              barAlphas.add(v == null ? 1f : v.getAlpha());
+                          }
                           barMode = 2;
                       }
-                      if (bar.getAlpha() != 0f) bar.setAlpha(0f);
+                      for (int i = 0; i < bars.size(); i++) {
+                          View v = bars.get(i).get();
+                          if (v != null && v.getAlpha() != 0f) v.setAlpha(0f);
+                      }
                   } else {
                       if (barMode != 1) {
                           bgViews.clear();
                           bgSaved.clear();
-                          collectBg(bar, 0);
-                          ViewParent pp = bar.getParent();
-                          if (pp instanceof ViewGroup) {
-                              ViewGroup g = (ViewGroup) pp;
-                              for (int i = 0; i < g.getChildCount(); i++) {
-                                  View c = g.getChildAt(i);
-                                  if (c == bar || c == pager || c.getVisibility() != View.VISIBLE) continue;
-                                  c.getLocationInWindow(tmpLoc);
-                                  if (c.getWidth() >= 0.9f * W && c.getHeight() <= 0.2f * H
-                                          && tmpLoc[1] + c.getHeight() >= H - 3) {
-                                      collectBg(c, 0);
+                          for (int i = 0; i < bars.size(); i++) {
+                              View bar = bars.get(i).get();
+                              if (bar == null) continue;
+                              collectBg(bar, 0);
+                              ViewParent pp = bar.getParent();
+                              if (pp instanceof ViewGroup) {
+                                  ViewGroup g = (ViewGroup) pp;
+                                  for (int k = 0; k < g.getChildCount(); k++) {
+                                      View c = g.getChildAt(k);
+                                      if (c == bar || c == pager || c.getVisibility() != View.VISIBLE) continue;
+                                      c.getLocationInWindow(tmpLoc);
+                                      if (c.getWidth() >= 0.9f * W && c.getHeight() <= 0.2f * H
+                                              && tmpLoc[1] + c.getHeight() >= H - 3) {
+                                          collectBg(c, 0);
+                                      }
                                   }
                               }
                           }
@@ -450,6 +481,21 @@ jobs:
                           if (v != null && v.getBackground() != null) v.setBackground(null);
                       }
                   }
+                  refreshBarDiag();
+              }
+          
+              private static void refreshBarDiag() {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append(bars.size()).append(" 个：");
+                  for (int i = 0; i < bars.size() && i < 3; i++) {
+                      View v = bars.get(i).get();
+                      if (v == null) continue;
+                      if (i > 0) sb.append("；");
+                      sb.append(shortName(v)).append(' ').append(v.getWidth()).append('x').append(v.getHeight())
+                              .append(" α=").append(String.format(Locale.US, "%.1f", v.getAlpha()));
+                  }
+                  diagBar = sb.toString();
+                  diagBarState = (barMode == 2 ? "完全隐藏" : "背景透明") + "（已处理背景 " + bgViews.size() + " 处）";
               }
           
               private static void collectBg(View v, int depth) {
@@ -466,9 +512,11 @@ jobs:
           
               private static void restoreBar() {
                   if (barMode == 0) return;
-                  View bar = barRef != null ? barRef.get() : null;
                   if (barMode == 2) {
-                      if (bar != null) bar.setAlpha(barOrigAlpha);
+                      for (int i = 0; i < bars.size(); i++) {
+                          View v = bars.get(i).get();
+                          if (v != null) v.setAlpha(i < barAlphas.size() ? barAlphas.get(i) : 1f);
+                      }
                   } else if (barMode == 1) {
                       for (int i = 0; i < bgViews.size(); i++) {
                           View v = bgViews.get(i).get();
@@ -480,12 +528,13 @@ jobs:
                   barMode = 0;
               }
           
-              /** 先按底部标签文字（首页/消息/我）找，再向上找包住它的通栏容器；找不到再按几何特征找 */
-              private static View findBar(View decor, View pager, int W, int H) {
-                  View tab = findTabText(decor, pager, H);
-                  if (tab != null) {
+              /** 找出所有「首页/消息/我」文字所在的底部通栏容器（可能有多个，全部处理） */
+              private static void findBars(View decor, View pager, int W, int H) {
+                  ArrayList<View> tabs = new ArrayList<>();
+                  collectTabTexts(decor, pager, H, tabs);
+                  for (int t = 0; t < tabs.size(); t++) {
                       View best = null;
-                      View p = tab;
+                      View p = tabs.get(t);
                       while (p != null) {
                           int h = p.getHeight();
                           if (h > 0.2f * H) break;
@@ -494,37 +543,37 @@ jobs:
                           ViewParent pp = p.getParent();
                           p = pp instanceof View ? (View) pp : null;
                       }
-                      if (best != null) return best;
+                      if (best == null) continue;
+                      boolean dup = false;
+                      for (int i = 0; i < bars.size(); i++) {
+                          if (bars.get(i).get() == best) dup = true;
+                      }
+                      if (!dup && bars.size() < 4) bars.add(new WeakReference<View>(best));
                   }
-                  if (barGap > 0) {
+                  if (bars.isEmpty() && barGap > 0) {
                       View[] best = new View[1];
                       int[] bestDepth = {Integer.MAX_VALUE};
                       scanBar(decor, pager, W, H, barGap, 0, best, bestDepth);
-                      return best[0];
+                      if (best[0] != null) bars.add(new WeakReference<View>(best[0]));
                   }
-                  return null;
               }
           
-              private static View findTabText(View v, View skip, int H) {
-                  if (v == skip || v.getVisibility() != View.VISIBLE) return null;
+              private static void collectTabTexts(View v, View skip, int H, ArrayList<View> out) {
+                  if (v == skip || v.getVisibility() != View.VISIBLE || out.size() >= 12) return;
                   if (v instanceof TextView) {
                       CharSequence t = ((TextView) v).getText();
                       if (t != null) {
                           String x = t.toString().trim();
                           if (x.equals("首页") || x.equals("消息") || x.equals("我")) {
                               v.getLocationInWindow(tmpLoc);
-                              if (tmpLoc[1] >= 0.8f * H) return v;
+                              if (tmpLoc[1] >= 0.8f * H) out.add(v);
                           }
                       }
                   }
                   if (v instanceof ViewGroup) {
                       ViewGroup g = (ViewGroup) v;
-                      for (int i = 0; i < g.getChildCount(); i++) {
-                          View r = findTabText(g.getChildAt(i), skip, H);
-                          if (r != null) return r;
-                      }
+                      for (int i = 0; i < g.getChildCount(); i++) collectTabTexts(g.getChildAt(i), skip, H, out);
                   }
-                  return null;
               }
           
               private static void scanBar(View v, View skip, int W, int H, int gap, int depth,
@@ -707,10 +756,15 @@ jobs:
                       TextView tip = new TextView(a);
                       tip.setText("回到首页即生效。使用本模块时，请关闭其他模块里的全屏、隐藏底栏等功能，避免互相冲突。"
                               + "\n\n【状态】（效果不对时请截图本面板）"
-                              + "\n视频流：" + diagPager
+                              + "\n视频流：" + (lastPagerInfo == null ? "还没找到（控件类名可能已变化）"
+                                      : lastPagerInfo + (inFeed ? "，首页中" : "，当前不在首页"))
                               + "\n底部缺口：" + diagGap
                               + "\n铺满：" + diagFix
-                              + "\n底栏：" + diagBar);
+                              + "\n底栏：" + diagBar
+                              + "\n底栏处理：" + diagBarState
+                              + "\n运行：回调 " + runCount + " 次，首页可见 " + visibleCount
+                              + " 次，应用底栏 " + applyCount + " 次"
+                              + "\n异常：" + diagErr);
                       tip.setTextColor(0xFF888888);
                       tip.setTextSize(12);
                       tip.setPadding(0, dp(a, 14), 0, 0);
@@ -729,7 +783,9 @@ jobs:
                       root.addView(close, new LinearLayout.LayoutParams(
                               LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
           
-                      d.setContentView(root);
+                      ScrollView sv = new ScrollView(a);
+                      sv.addView(root);
+                      d.setContentView(sv);
                       d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
                       d.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
                           @Override
