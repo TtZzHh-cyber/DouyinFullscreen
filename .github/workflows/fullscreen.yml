@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 5
-                  versionName '1.4'
+                  versionCode 6
+                  versionName '1.5'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -132,14 +132,10 @@ jobs:
            * 抖音首页视频流铺满全屏：
            * 1. 把首页视频翻页控件（RTViewPager）向下延伸到屏幕底部；
            * 2. 底部标签栏设为透明（仍可点击）。
-           * 所有改动在绘制前一次完成，不会在翻页过程中改变布局，避免黑屏闪烁。
            *
-           * v1.4 修复：底栏闪烁下一视频顶部画面
-           *   原因：applyCover 会遍历 pager 所有子页（含预加载的下一页），
-           *   把它们一并放大并向屏幕底部溢出；配合 pager 及祖先 setClipChildren(false)
-           *   以及透明底栏，下一视频顶部被放大溢出的部分就从底栏区域透了出来，
-           *   滑动时不断出现/消失，形成闪烁。
-           *   修复：只对"当前页"做放大，相邻/预加载页一律恢复原状。
+           * v1.5 修复：
+           * 1. 解决底栏透明后，滑动时下一个视频顶部画面闪烁的问题（不再移除底栏兄弟节点的渐变遮罩，改用 ColorDrawable.TRANSPARENT 替换背景防重绘闪烁）；
+           * 2. 解决画面放大时，预加载的下一页溢出到屏幕底部导致闪烁的问题（增加当前页判定，只放大当前页）。
            */
           public class MainHook implements IXposedHookLoadPackage {
           
@@ -461,14 +457,23 @@ jobs:
           
               /**
                * 判断某个 item 是否为"当前页"。
-               * 依据：item 在屏幕中的可见高度 ≥ 自身高度 90%（滑动过程中相邻页会被挤出屏幕）。
-               * 只有当前页才允许放大，相邻/预加载页放大后其溢出到 pager 边界外的顶部画面
-               * 会从透明底栏区域透出来，滑动时表现为闪烁。
+               * 依据：item 在屏幕中的可见高度 ≥ 自身高度 90%，且中心点靠近屏幕中心。
                */
-              private static boolean isCurrentItem(View item) {
+              private static boolean isCurrentItem(View item, int H) {
                   if (item.getWidth() <= 0 || item.getHeight() <= 0) return false;
                   if (!item.getGlobalVisibleRect(tmpRect)) return false;
-                  return tmpRect.height() >= item.getHeight() * 0.9f;
+                  
+                  if (tmpRect.height() < item.getHeight() * 0.9f) return false;
+                  
+                  int[] loc = new int[2];
+                  item.getLocationOnScreen(loc);
+                  int centerY = loc[1] + item.getHeight() / 2;
+                  int screenCenterY = H / 2;
+                  
+                  if (Math.abs(centerY - screenCenterY) > H * 0.2f) {
+                      return false;
+                  }
+                  return true;
               }
           
               /** 把某个 item 上做过的放大/位移恢复原状（用于相邻页、预加载页） */
@@ -491,7 +496,7 @@ jobs:
               /**
                * 只对视频画面（VideoPinchViewContainer 及封面）做缩放，让竖屏视频铺满到屏幕底部；
                * 文案、按钮、进度条等不做任何改动，所以位置完全不变。
-               * 并且只处理当前页，相邻页/预加载页保持原样，避免溢出到下个视频或底栏区域。
+               * 并且只处理当前页，相邻页/预加载页保持原样。
                */
               private static void applyCover(View pager, int H, long now) {
                   if (!(pager instanceof ViewGroup)) return;
@@ -512,8 +517,8 @@ jobs:
                       View item = pg.getChildAt(i);
                       if (item.getWidth() <= 0 || item.getHeight() <= 0) continue;
           
-                      // ★ 关键修复：只对当前页做放大；其余页一律恢复原状
-                      if (!isCurrentItem(item)) {
+                      // ★ 只对当前页做放大；其余页一律恢复原状
+                      if (!isCurrentItem(item, H)) {
                           resetItemParts(item);
                           continue;
                       }
@@ -646,26 +651,18 @@ jobs:
                           for (int i = 0; i < bars.size(); i++) {
                               View bar = bars.get(i).get();
                               if (bar == null) continue;
+                              
+                              // ★ 修改1：只收集底栏自身的背景，不再清除兄弟节点（底部渐变遮罩），防止画面断层闪烁
                               collectBg(bar, 0);
-                              ViewParent pp = bar.getParent();
-                              if (pp instanceof ViewGroup) {
-                                  ViewGroup g = (ViewGroup) pp;
-                                  for (int k = 0; k < g.getChildCount(); k++) {
-                                      View c = g.getChildAt(k);
-                                      if (c == bar || c == pager || c.getVisibility() != View.VISIBLE) continue;
-                                      c.getLocationInWindow(tmpLoc);
-                                      if (c.getWidth() >= 0.9f * W && c.getHeight() <= 0.2f * H
-                                              && tmpLoc[1] + c.getHeight() >= H - 3) {
-                                          collectBg(c, 0);
-                                      }
-                                  }
-                              }
                           }
                           barMode = 1;
                       }
                       for (int i = 0; i < bgViews.size(); i++) {
                           View v = bgViews.get(i).get();
-                          if (v != null && v.getBackground() != null) v.setBackground(null);
+                          if (v != null && v.getBackground() != null) {
+                              // ★ 修改2：用透明 Drawable 替换，而不是 null，避免滑动重绘时闪烁
+                              v.setBackground(new ColorDrawable(Color.TRANSPARENT));
+                          }
                       }
                   }
                   refreshBarDiag();
