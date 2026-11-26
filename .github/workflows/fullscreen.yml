@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 7
-                  versionName '1.6'
+                  versionCode 5
+                  versionName '1.4'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -132,11 +132,7 @@ jobs:
            * 抖音首页视频流铺满全屏：
            * 1. 把首页视频翻页控件（RTViewPager）向下延伸到屏幕底部；
            * 2. 底部标签栏设为透明（仍可点击）。
-           *
-           * v1.6 修复：
-           * 1. 彻底解决底栏透明时，滑动画面闪烁：将底栏所有兄弟节点（底部黑色渐变遮罩）一并透明化；
-           * 2. 解决 pager 预加载页面漏边：不再修改 pager 本身的 setClipChildren，只在 item 内部放开裁剪；
-           * 3. 解决底栏变透明后背景被重置的问题：强制 setBackground(null)。
+           * 所有改动在绘制前一次完成，不会在翻页过程中改变布局，避免黑屏闪烁。
            */
           public class MainHook implements IXposedHookLoadPackage {
           
@@ -177,6 +173,9 @@ jobs:
               private static int scanMiss = 0;
               private static final WeakHashMap<View, View[]> itemParts = new WeakHashMap<>();
               private static final WeakHashMap<View, Float> touched = new WeakHashMap<>();
+              private static final WeakHashMap<View, Boolean> clipped = new WeakHashMap<>();
+              private static final Rect clipRect = new Rect();
+              private static long lastDescribe = 0;
               private static boolean extended = false;
               private static int barMode = 0; // 0 = 未处理，1 = 背景透明，2 = 完全隐藏
               private static final ArrayList<WeakReference<View>> bars = new ArrayList<>();
@@ -191,6 +190,8 @@ jobs:
               private static String diagFix = "-";
               private static String diagBar = "-";
               private static String diagCover = "-";
+              private static String diagVideoItem = "-";
+              private static String diagOtherItem = "-";
               private static String diagBarState = "-";
               private static String diagErr = "无";
               private static String lastPagerInfo = null;
@@ -457,47 +458,8 @@ jobs:
               }
           
               /**
-               * 判断某个 item 是否为"当前页"。
-               * 依据：item 在屏幕中的可见高度 ≥ 自身高度 90%，且中心点靠近屏幕中心。
-               */
-              private static boolean isCurrentItem(View item, int H) {
-                  if (item.getWidth() <= 0 || item.getHeight() <= 0) return false;
-                  if (!item.getGlobalVisibleRect(tmpRect)) return false;
-                  
-                  if (tmpRect.height() < item.getHeight() * 0.9f) return false;
-                  
-                  int[] loc = new int[2];
-                  item.getLocationOnScreen(loc);
-                  int centerY = loc[1] + item.getHeight() / 2;
-                  int screenCenterY = H / 2;
-                  
-                  if (Math.abs(centerY - screenCenterY) > H * 0.2f) {
-                      return false;
-                  }
-                  return true;
-              }
-          
-              /** 把某个 item 上做过的放大/位移恢复原状（用于相邻页、预加载页） */
-              private static void resetItemParts(View item) {
-                  View[] parts = itemParts.get(item);
-                  if (parts == null) return;
-                  for (int k = 0; k < parts.length; k++) {
-                      View v = parts[k];
-                      if (v == null) continue;
-                      Float s = touched.get(v);
-                      if (s != null && v.getScaleX() == s) {
-                          v.setScaleX(1f);
-                          v.setScaleY(1f);
-                          v.setTranslationY(0f);
-                      }
-                      if (s != null) touched.remove(v);
-                  }
-              }
-          
-              /**
                * 只对视频画面（VideoPinchViewContainer 及封面）做缩放，让竖屏视频铺满到屏幕底部；
                * 文案、按钮、进度条等不做任何改动，所以位置完全不变。
-               * 并且只处理当前页，相邻页/预加载页保持原样。
                */
               private static void applyCover(View pager, int H, long now) {
                   if (!(pager instanceof ViewGroup)) return;
@@ -505,10 +467,26 @@ jobs:
                   pager.getLocationInWindow(tmpLoc);
                   int gapPx = H - (tmpLoc[1] + pager.getHeight());
                   int gap = (gapPx >= 2 && gapPx <= 0.10f * H) ? gapPx : 0;
-                  
-                  // ★ 关键修改：不再对 pager 设置 setClipChildren(false)，避免下一页漏出底部
                   if (gap > 0 && !unclipped) {
+                      pg.setClipChildren(false);
+                      unclipUp(pager, null);
                       unclipped = true;
+                  }
+          
+                  // 找出当前页（与视频流可见区域重叠最多的那一页）。画面伸进底栏区域后，
+                  // 紧挨在下面的下一页会盖在上面，所以其余页要裁剪到视频流范围内
+                  int pagerTop = tmpLoc[1];
+                  int pagerBottom = pagerTop + pager.getHeight();
+                  int curIdx = -1;
+                  int bestOv = Integer.MIN_VALUE;
+                  for (int i = 0; i < pg.getChildCount(); i++) {
+                      View it = pg.getChildAt(i);
+                      it.getLocationInWindow(tmpLoc);
+                      int ov = Math.min(tmpLoc[1] + it.getHeight(), pagerBottom) - Math.max(tmpLoc[1], pagerTop);
+                      if (ov > bestOv) {
+                          bestOv = ov;
+                          curIdx = i;
+                      }
                   }
           
                   int handled = 0;
@@ -518,10 +496,17 @@ jobs:
                       View item = pg.getChildAt(i);
                       if (item.getWidth() <= 0 || item.getHeight() <= 0) continue;
           
-                      // ★ 只对当前页做放大；其余页一律恢复原状
-                      if (!isCurrentItem(item, H)) {
-                          resetItemParts(item);
-                          continue;
+                      if (gap > 0 && i != curIdx) {
+                          item.getLocationInWindow(tmpLoc);
+                          int top = tmpLoc[1];
+                          int bottom = pagerBottom - top;
+                          int upper = pagerTop - top;
+                          if (bottom < upper) bottom = upper;
+                          clipRect.set(0, upper, item.getWidth(), bottom);
+                          clipped.put(item, Boolean.TRUE);
+                          item.setClipBounds(clipRect);
+                      } else if (clipped.remove(item) != null) {
+                          item.setClipBounds(null);
                       }
           
                       View[] parts = itemParts.get(item);
@@ -534,17 +519,16 @@ jobs:
                               parts = new View[] {c, cv};
                               itemParts.put(item, parts);
                               if (item instanceof ViewGroup) ((ViewGroup) item).setClipChildren(false);
-                              // ★ 关键修改：只在 item 内部以及它的直接子容器放开裁剪，不涉及 pager 本身
-                              ViewParent p = item.getParent();
-                              while (p instanceof ViewGroup && p != pager) {
-                                  ((ViewGroup) p).setClipChildren(false);
-                                  p = p.getParent();
-                              }
                               if (c != null) unclipUp(c, item);
                           }
                       }
                       View container = parts == null ? null : parts[0];
                       View cover = parts == null ? null : parts[1];
+                      if (i == curIdx && now - lastDescribe >= 1000) {
+                          lastDescribe = now;
+                          if (container != null) diagVideoItem = describeItem(item);
+                          else diagOtherItem = describeItem(item);
+                      }
                       if (container == null) continue;
                       if (!(container instanceof ViewGroup) || ((ViewGroup) container).getChildCount() == 0) {
                           why = "视频画面控件里没有内容";
@@ -593,7 +577,31 @@ jobs:
                   touched.put(v, s);
               }
           
+              private static String describeItem(View item) {
+                  StringBuilder sb = new StringBuilder(shortName(item));
+                  sb.append(' ').append(item.getWidth()).append('x').append(item.getHeight()).append(" [");
+                  if (item instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) item;
+                      int n = Math.min(g.getChildCount(), 16);
+                      for (int i = 0; i < n; i++) {
+                          View c = g.getChildAt(i);
+                          if (i > 0) sb.append("，");
+                          sb.append(shortName(c));
+                          if (c.getVisibility() == View.GONE) sb.append("(隐)");
+                          else sb.append(' ').append(c.getWidth()).append('x').append(c.getHeight());
+                      }
+                      if (g.getChildCount() > n) sb.append("…");
+                  }
+                  return sb.append(']').toString();
+              }
+          
               private static void resetCover() {
+                  if (!clipped.isEmpty()) {
+                      for (View v : clipped.keySet()) {
+                          if (v != null) v.setClipBounds(null);
+                      }
+                      clipped.clear();
+                  }
                   if (touched.isEmpty()) return;
                   for (Map.Entry<View, Float> e : touched.entrySet()) {
                       View v = e.getKey();
@@ -658,11 +666,7 @@ jobs:
                           for (int i = 0; i < bars.size(); i++) {
                               View bar = bars.get(i).get();
                               if (bar == null) continue;
-                              
-                              // ★ 关键修改1：收集底栏自身的背景
                               collectBg(bar, 0);
-                              
-                              // ★ 关键修改2：收集底栏的兄弟节点（底部渐变黑边遮罩），一并透明化
                               ViewParent pp = bar.getParent();
                               if (pp instanceof ViewGroup) {
                                   ViewGroup g = (ViewGroup) pp;
@@ -681,11 +685,7 @@ jobs:
                       }
                       for (int i = 0; i < bgViews.size(); i++) {
                           View v = bgViews.get(i).get();
-                          if (v != null) {
-                              // ★ 关键修改3：强制清空背景和前景（同时设为 null，防止抖音重置）
-                              if (v.getBackground() != null) v.setBackground(null);
-                              if (v.getForeground() != null) v.setForeground(null);
-                          }
+                          if (v != null && v.getBackground() != null) v.setBackground(null);
                       }
                   }
                   refreshBarDiag();
@@ -978,6 +978,8 @@ jobs:
                               + "\n底部缺口：" + diagGap
                               + "\n画面铺满：" + diagCover
                               + "\n布局拉伸：" + diagFix
+                              + "\n视频页结构：" + diagVideoItem
+                              + "\n其他页（如直播）结构：" + diagOtherItem
                               + "\n底栏：" + diagBar
                               + "\n底栏处理：" + diagBarState
                               + "\n运行：回调 " + runCount + " 次，首页可见 " + visibleCount
