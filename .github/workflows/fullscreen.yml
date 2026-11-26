@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 5
-                  versionName '1.4'
+                  versionCode 6
+                  versionName '1.5'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -176,6 +176,11 @@ jobs:
               private static final WeakHashMap<View, Boolean> clipped = new WeakHashMap<>();
               private static final Rect clipRect = new Rect();
               private static long lastDescribe = 0;
+              private static int lastCurTop = Integer.MIN_VALUE;
+              private static int lastCurIdx = -1;
+              private static int stableFrames = 0;
+              private static boolean wasSettled = false;
+              private static long settleTime = 0;
               private static boolean extended = false;
               private static int barMode = 0; // 0 = 未处理，1 = 背景透明，2 = 完全隐藏
               private static final ArrayList<WeakReference<View>> bars = new ArrayList<>();
@@ -478,6 +483,7 @@ jobs:
                   int pagerTop = tmpLoc[1];
                   int pagerBottom = pagerTop + pager.getHeight();
                   int curIdx = -1;
+                  int curTop = 0;
                   int bestOv = Integer.MIN_VALUE;
                   for (int i = 0; i < pg.getChildCount(); i++) {
                       View it = pg.getChildAt(i);
@@ -486,8 +492,28 @@ jobs:
                       if (ov > bestOv) {
                           bestOv = ov;
                           curIdx = i;
+                          curTop = tmpLoc[1];
                       }
                   }
+          
+                  // 只有「静止下来」的当前页才把画面伸进底栏区域；翻页过程中所有页都裁剪在视频流范围内，
+                  // 这样翻页时底栏区域不会出现相邻页的内容，也不会在翻到一半时突变
+                  boolean settled = false;
+                  if (curIdx >= 0) {
+                      if (curTop == lastCurTop && curIdx == lastCurIdx) {
+                          stableFrames++;
+                      } else {
+                          stableFrames = 0;
+                          lastCurTop = curTop;
+                          lastCurIdx = curIdx;
+                      }
+                      settled = stableFrames >= 4 && Math.abs(curTop - pagerTop) <= 2;
+                  }
+                  if (settled && !wasSettled) settleTime = now;
+                  wasSettled = settled;
+                  float frac = settled ? Math.min(1f, (now - settleTime) / 120f) : 0f; // 静止后 0.12 秒内渐渐露出
+                  boolean scanCover = now - lastPartScan >= 250;
+                  if (scanCover) lastPartScan = now;
           
                   int handled = 0;
                   float shown = 1f;
@@ -496,11 +522,12 @@ jobs:
                       View item = pg.getChildAt(i);
                       if (item.getWidth() <= 0 || item.getHeight() <= 0) continue;
           
-                      if (gap > 0 && i != curIdx) {
+                      if (gap > 0) {
                           item.getLocationInWindow(tmpLoc);
                           int top = tmpLoc[1];
-                          int bottom = pagerBottom - top;
                           int upper = pagerTop - top;
+                          int bottom = pagerBottom - top;
+                          if (i == curIdx && settled) bottom += Math.round(gap * frac);
                           if (bottom < upper) bottom = upper;
                           clipRect.set(0, upper, item.getWidth(), bottom);
                           clipped.put(item, Boolean.TRUE);
@@ -510,20 +537,21 @@ jobs:
                       }
           
                       View[] parts = itemParts.get(item);
-                      if (parts == null || parts[0] == null || parts[1] == null) {
-                          if (parts == null || now - lastPartScan >= 250) {
-                              lastPartScan = now;
-                              View c = parts != null && parts[0] != null ? parts[0]
-                                      : findPart(item, ".VideoPinchViewContainer", 4);
-                              View cv = findPart(item, ".CoverImageView", 9);
-                              parts = new View[] {c, cv};
-                              itemParts.put(item, parts);
-                              if (item instanceof ViewGroup) ((ViewGroup) item).setClipChildren(false);
-                              if (c != null) unclipUp(c, item);
+                      if (parts == null) {
+                          parts = new View[2];
+                          itemParts.put(item, parts);
+                          if (item instanceof ViewGroup) ((ViewGroup) item).setClipChildren(false);
+                      }
+                      if (parts[0] == null) { // 视频画面控件每帧都找（很浅，开销小），避免新页面的放大来得晚而跳一下
+                          View c = findPart(item, ".VideoPinchViewContainer", 3);
+                          if (c != null) {
+                              parts[0] = c;
+                              unclipUp(c, item);
                           }
                       }
-                      View container = parts == null ? null : parts[0];
-                      View cover = parts == null ? null : parts[1];
+                      if (parts[1] == null && scanCover) parts[1] = findPart(item, ".CoverImageView", 9);
+                      View container = parts[0];
+                      View cover = parts[1];
                       if (i == curIdx && now - lastDescribe >= 1000) {
                           lastDescribe = now;
                           if (container != null) diagVideoItem = describeItem(item);
@@ -561,7 +589,8 @@ jobs:
                       handled++;
                       shown = s;
                   }
-                  diagCover = handled + " 页，缩放 " + String.format(Locale.US, "%.2f", shown) + "，缺口 " + gap + "px（" + why + "）";
+                  diagCover = handled + " 页，缩放 " + String.format(Locale.US, "%.2f", shown) + "，缺口 " + gap + "px，"
+                          + (settled ? "静止" : "翻页中") + "（" + why + "）";
               }
           
               private static void setCover(View v, float s, float ty) {
