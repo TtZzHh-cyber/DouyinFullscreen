@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 6
-                  versionName '1.5'
+                  versionCode 7
+                  versionName '1.6'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -173,14 +173,11 @@ jobs:
               private static int scanMiss = 0;
               private static final WeakHashMap<View, View[]> itemParts = new WeakHashMap<>();
               private static final WeakHashMap<View, Float> touched = new WeakHashMap<>();
-              private static final WeakHashMap<View, Boolean> clipped = new WeakHashMap<>();
-              private static final Rect clipRect = new Rect();
               private static long lastDescribe = 0;
-              private static int lastCurTop = Integer.MIN_VALUE;
-              private static int lastCurIdx = -1;
-              private static int stableFrames = 0;
-              private static boolean wasSettled = false;
-              private static long settleTime = 0;
+              private static long lastDescribeO = 0;
+              private static final WeakHashMap<View, Float> shiftSet = new WeakHashMap<>();
+              private static final WeakHashMap<View, Float> shiftBase = new WeakHashMap<>();
+              private static final WeakHashMap<View, ArrayList<View>> leafCache = new WeakHashMap<>();
               private static boolean extended = false;
               private static int barMode = 0; // 0 = 未处理，1 = 背景透明，2 = 完全隐藏
               private static final ArrayList<WeakReference<View>> bars = new ArrayList<>();
@@ -470,7 +467,9 @@ jobs:
                   if (!(pager instanceof ViewGroup)) return;
                   ViewGroup pg = (ViewGroup) pager;
                   pager.getLocationInWindow(tmpLoc);
-                  int gapPx = H - (tmpLoc[1] + pager.getHeight());
+                  int pagerTop = tmpLoc[1];
+                  int pagerBottom = pagerTop + pager.getHeight();
+                  int gapPx = H - pagerBottom;
                   int gap = (gapPx >= 2 && gapPx <= 0.10f * H) ? gapPx : 0;
                   if (gap > 0 && !unclipped) {
                       pg.setClipChildren(false);
@@ -478,12 +477,8 @@ jobs:
                       unclipped = true;
                   }
           
-                  // 找出当前页（与视频流可见区域重叠最多的那一页）。画面伸进底栏区域后，
-                  // 紧挨在下面的下一页会盖在上面，所以其余页要裁剪到视频流范围内
-                  int pagerTop = tmpLoc[1];
-                  int pagerBottom = pagerTop + pager.getHeight();
+                  // 当前页（与视频流可见区域重叠最多的那一页），仅用于显示结构信息
                   int curIdx = -1;
-                  int curTop = 0;
                   int bestOv = Integer.MIN_VALUE;
                   for (int i = 0; i < pg.getChildCount(); i++) {
                       View it = pg.getChildAt(i);
@@ -492,26 +487,9 @@ jobs:
                       if (ov > bestOv) {
                           bestOv = ov;
                           curIdx = i;
-                          curTop = tmpLoc[1];
                       }
                   }
           
-                  // 只有「静止下来」的当前页才把画面伸进底栏区域；翻页过程中所有页都裁剪在视频流范围内，
-                  // 这样翻页时底栏区域不会出现相邻页的内容，也不会在翻到一半时突变
-                  boolean settled = false;
-                  if (curIdx >= 0) {
-                      if (curTop == lastCurTop && curIdx == lastCurIdx) {
-                          stableFrames++;
-                      } else {
-                          stableFrames = 0;
-                          lastCurTop = curTop;
-                          lastCurIdx = curIdx;
-                      }
-                      settled = stableFrames >= 4 && Math.abs(curTop - pagerTop) <= 2;
-                  }
-                  if (settled && !wasSettled) settleTime = now;
-                  wasSettled = settled;
-                  float frac = settled ? Math.min(1f, (now - settleTime) / 120f) : 0f; // 静止后 0.12 秒内渐渐露出
                   boolean scanCover = now - lastPartScan >= 250;
                   if (scanCover) lastPartScan = now;
           
@@ -521,20 +499,13 @@ jobs:
                   for (int i = 0; i < pg.getChildCount(); i++) {
                       View item = pg.getChildAt(i);
                       if (item.getWidth() <= 0 || item.getHeight() <= 0) continue;
+                      int rw = item.getWidth();
+                      int rh = item.getHeight();
           
-                      if (gap > 0) {
-                          item.getLocationInWindow(tmpLoc);
-                          int top = tmpLoc[1];
-                          int upper = pagerTop - top;
-                          int bottom = pagerBottom - top;
-                          if (i == curIdx && settled) bottom += Math.round(gap * frac);
-                          if (bottom < upper) bottom = upper;
-                          clipRect.set(0, upper, item.getWidth(), bottom);
-                          clipped.put(item, Boolean.TRUE);
-                          item.setClipBounds(clipRect);
-                      } else if (clipped.remove(item) != null) {
-                          item.setClipBounds(null);
-                      }
+                      // 间距补偿：每页按它离视频流顶部的距离做平移，让页与页之间的视觉间距等于「页高+缺口」，
+                      // 这样每页伸进底栏区域的画面刚好接上下一页，翻页全程没有黑条，也不会露出相邻页。
+                      // 页面停稳时补偿为 0，文案和按钮位置不变。
+                      shiftItem(item, gap, pagerTop);
           
                       View[] parts = itemParts.get(item);
                       if (parts == null) {
@@ -552,12 +523,26 @@ jobs:
                       if (parts[1] == null && scanCover) parts[1] = findPart(item, ".CoverImageView", 9);
                       View container = parts[0];
                       View cover = parts[1];
+          
+                      if (container == null) {
+                          // 不是普通视频页（如直播页）：把页面里铺满的大图/视频控件放大，文字按钮等小控件不动
+                          int n = scaleMediaLeaves(item, rw, rh, gap, scanCover);
+                          if (i == curIdx && now - lastDescribeO >= 1000) {
+                              lastDescribeO = now;
+                              StringBuilder sb = new StringBuilder();
+                              treeStr(item, 3, sb);
+                              diagOtherItem = sb.toString();
+                          }
+                          if (n > 0) {
+                              handled++;
+                              why = "非视频页，放大了 " + n + " 个媒体控件";
+                          }
+                          continue;
+                      }
                       if (i == curIdx && now - lastDescribe >= 1000) {
                           lastDescribe = now;
-                          if (container != null) diagVideoItem = describeItem(item);
-                          else diagOtherItem = describeItem(item);
+                          diagVideoItem = describeItem(item);
                       }
-                      if (container == null) continue;
                       if (!(container instanceof ViewGroup) || ((ViewGroup) container).getChildCount() == 0) {
                           why = "视频画面控件里没有内容";
                           continue;
@@ -565,8 +550,6 @@ jobs:
                       View inner = ((ViewGroup) container).getChildAt(0);
                       int iw = inner.getWidth();
                       int ih = inner.getHeight();
-                      int rw = item.getWidth();
-                      int rh = item.getHeight();
           
                       float s = 1f;
                       float ty = 0f;
@@ -589,8 +572,92 @@ jobs:
                       handled++;
                       shown = s;
                   }
-                  diagCover = handled + " 页，缩放 " + String.format(Locale.US, "%.2f", shown) + "，缺口 " + gap + "px，"
-                          + (settled ? "静止" : "翻页中") + "（" + why + "）";
+                  diagCover = handled + " 页，缩放 " + String.format(Locale.US, "%.2f", shown) + "，缺口 " + gap + "px（" + why + "）";
+              }
+          
+              /** 让每页的视觉间距等于「页高+缺口」；topBase 去掉了我们自己上一帧加的平移，避免反馈抖动 */
+              private static void shiftItem(View item, int gap, int pagerTop) {
+                  float cur = item.getTranslationY();
+                  Float ls = shiftSet.get(item);
+                  Float bs = shiftBase.get(item);
+                  float base;
+                  float prev;
+                  if (ls != null && bs != null && cur == ls) {
+                      base = bs;
+                      prev = ls - bs;
+                  } else {
+                      base = cur; // 第一次，或抖音自己改过平移：以它当前的值为准
+                      prev = 0f;
+                  }
+                  float nt = base;
+                  if (gap > 0 && item.getHeight() > 0) {
+                      item.getLocationInWindow(tmpLoc);
+                      float topBase = tmpLoc[1] - prev;
+                      nt = base + (topBase - pagerTop) * gap / item.getHeight();
+                  }
+                  if (nt != cur) item.setTranslationY(nt);
+                  shiftSet.put(item, nt);
+                  shiftBase.put(item, base);
+              }
+          
+              private static void collectLeaves(View v, int rw, int rh, int depth, ArrayList<View> out) {
+                  if (depth > 6 || out.size() >= 6) return;
+                  if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) collectLeaves(g.getChildAt(i), rw, rh, depth + 1, out);
+                  } else if (v.getWidth() >= 0.9f * rw && v.getHeight() >= 0.6f * rh) {
+                      out.add(v);
+                  }
+              }
+          
+              /** 非视频页：放大页面里铺满的大图/视频控件（叶子控件），文字按钮等小控件不动 */
+              private static int scaleMediaLeaves(View item, int rw, int rh, int gap, boolean scan) {
+                  ArrayList<View> leaves = leafCache.get(item);
+                  if (leaves == null || (leaves.isEmpty() && scan)) {
+                      leaves = new ArrayList<>();
+                      collectLeaves(item, rw, rh, 0, leaves);
+                      leafCache.put(item, leaves);
+                      if (item instanceof ViewGroup) ((ViewGroup) item).setClipChildren(false);
+                      for (int i = 0; i < leaves.size(); i++) unclipUp(leaves.get(i), item);
+                  }
+                  int n = 0;
+                  for (int i = 0; i < leaves.size(); i++) {
+                      View l = leaves.get(i);
+                      int lw = l.getWidth();
+                      int lh = l.getHeight();
+                      if (lw <= 0 || lh <= 0) continue;
+                      float s = 1f;
+                      float ty = 0f;
+                      float want = Math.max((float) rw / lw, (rh + gap) / (float) lh);
+                      if (want > 1.01f && want <= 1.35f) {
+                          s = want;
+                          ty = gap / 2f;
+                      }
+                      setCover(l, s, ty);
+                      if (s > 1f) n++;
+                  }
+                  return n;
+              }
+          
+              private static void treeStr(View v, int depth, StringBuilder sb) {
+                  if (sb.length() > 900) return;
+                  sb.append(shortName(v));
+                  if (v.getVisibility() == View.GONE) {
+                      sb.append("(隐)");
+                      return;
+                  }
+                  sb.append(' ').append(v.getWidth()).append('x').append(v.getHeight());
+                  if (depth > 0 && v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      int n = Math.min(g.getChildCount(), 10);
+                      if (n > 0) sb.append(" {");
+                      for (int i = 0; i < n; i++) {
+                          if (i > 0) sb.append("，");
+                          treeStr(g.getChildAt(i), depth - 1, sb);
+                      }
+                      if (g.getChildCount() > n) sb.append("…");
+                      if (n > 0) sb.append("}");
+                  }
               }
           
               private static void setCover(View v, float s, float ty) {
@@ -625,11 +692,17 @@ jobs:
               }
           
               private static void resetCover() {
-                  if (!clipped.isEmpty()) {
-                      for (View v : clipped.keySet()) {
-                          if (v != null) v.setClipBounds(null);
+                  if (!shiftSet.isEmpty()) {
+                      for (Map.Entry<View, Float> e : shiftSet.entrySet()) {
+                          View v = e.getKey();
+                          Float ls = e.getValue();
+                          Float bs = shiftBase.get(v);
+                          if (v != null && ls != null && bs != null && v.getTranslationY() == ls) {
+                              v.setTranslationY(bs);
+                          }
                       }
-                      clipped.clear();
+                      shiftSet.clear();
+                      shiftBase.clear();
                   }
                   if (touched.isEmpty()) return;
                   for (Map.Entry<View, Float> e : touched.entrySet()) {
