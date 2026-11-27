@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 9
-                  versionName '1.8'
+                  versionCode 10
+                  versionName '1.9'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -184,6 +184,14 @@ jobs:
               private static final ArrayList<WeakReference<View>> corners = new ArrayList<>();
               private static final ArrayList<Float> cornerAlphas = new ArrayList<>();
               private static long lastCornerScan = 0;
+              private static volatile boolean pureBlack = false;
+              private static WeakReference<Activity> feedActivity;
+              private static final ArrayList<WeakReference<View>> blackViews = new ArrayList<>();
+              private static final ArrayList<Drawable> blackSaved = new ArrayList<>();
+              private static long lastBlackScan = 0;
+              private static boolean winApplied = false;
+              private static Drawable winBgSaved;
+              private static String diagBlack = "-";
               private static final WeakHashMap<View, ArrayList<View>> bgCache = new WeakHashMap<>();
               private static final WeakHashMap<View, Boolean> stretched = new WeakHashMap<>();
               private static long lastDescribeL = 0;
@@ -243,6 +251,7 @@ jobs:
           
               private static void attachFeedListener(Activity a) {
                   final View decor = a.getWindow().getDecorView();
+                  feedActivity = new WeakReference<Activity>(a);
                   if (listenerDecor != null && listenerDecor.get() == decor) return;
                   listenerDecor = new WeakReference<View>(decor);
                   pagerRef = null;
@@ -305,6 +314,7 @@ jobs:
                           restoreBar();
                           resetCover();
                           restoreCorners();
+                          restorePureBlack();
                       }
                       if (now - lastScan >= 500) {
                           lastScan = now;
@@ -333,6 +343,7 @@ jobs:
                   fixSeam(decor, W, H, tmpLoc[1] + pager.getHeight(),
                           (gapNow >= 2 && gapNow <= 0.10f * H) ? gapNow : 0, now);
                   applyBar(decor, pager, W, H, now);
+                  applyPureBlack(decor, pager, W, H, now);
                   return relayout;
               }
           
@@ -972,6 +983,82 @@ jobs:
                   }
               }
           
+              // ================= 底栏区域纯黑 =================
+          
+              private static void blackenIfColor(View v) {
+                  Drawable d = v.getBackground();
+                  if (!(d instanceof ColorDrawable)) return;
+                  int c = ((ColorDrawable) d).getColor();
+                  if (Color.alpha(c) == 0 || (c & 0x00FFFFFF) == 0) return; // 透明或已经是黑色
+                  boolean known = false;
+                  for (int i = 0; i < blackViews.size(); i++) {
+                      if (blackViews.get(i).get() == v) known = true;
+                  }
+                  if (!known && blackViews.size() < 40) {
+                      blackViews.add(new WeakReference<View>(v));
+                      blackSaved.add(d);
+                  }
+                  v.setBackgroundColor(Color.BLACK);
+              }
+          
+              /** 贴着屏幕底边、通栏、不包含视频流的底部控件（如底栏、占位控件）：它们的底色也改成黑 */
+              private static void scanBottomColors(View v, View skip, int W, int H, int depth) {
+                  if (v == skip || v.getVisibility() != View.VISIBLE || depth > 12) return;
+                  int h = v.getHeight();
+                  if (h > 0 && h <= 0.2f * H && v.getWidth() >= 0.9f * W) {
+                      v.getLocationInWindow(tmpLoc);
+                      if (tmpLoc[1] + h >= H - 3) blackenIfColor(v);
+                  }
+                  if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) scanBottomColors(g.getChildAt(i), skip, W, H, depth + 1);
+                  }
+              }
+          
+              /**
+               * 底栏区域露出来的灰色（抖音深色主题的深蓝灰底色）统一改成纯黑：
+               * 窗口背景、视频流的各级父控件、底部通栏控件的纯色底色。不缩放、不移动任何内容。
+               */
+              private static void applyPureBlack(View decor, View pager, int W, int H, long now) {
+                  if (!pureBlack) {
+                      restorePureBlack();
+                      return;
+                  }
+                  if (now - lastBlackScan < 500) return;
+                  lastBlackScan = now;
+          
+                  Activity a = feedActivity != null ? feedActivity.get() : null;
+                  if (a != null && !winApplied) {
+                      winBgSaved = decor.getBackground();
+                      a.getWindow().setBackgroundDrawable(new ColorDrawable(Color.BLACK));
+                      winApplied = true;
+                  }
+                  ViewParent p = pager.getParent();
+                  int guard = 0;
+                  while (p instanceof View && guard++ < 30) {
+                      View v = (View) p;
+                      if (v != decor) blackenIfColor(v);
+                      p = v.getParent();
+                  }
+                  scanBottomColors(decor, pager, W, H, 0);
+                  diagBlack = "已处理 " + blackViews.size() + " 处底色" + (winApplied ? "，窗口背景已设为黑色" : "");
+              }
+          
+              private static void restorePureBlack() {
+                  if (!winApplied && blackViews.isEmpty()) return;
+                  for (int i = 0; i < blackViews.size(); i++) {
+                      View v = blackViews.get(i).get();
+                      if (v != null && i < blackSaved.size()) v.setBackground(blackSaved.get(i));
+                  }
+                  blackViews.clear();
+                  blackSaved.clear();
+                  if (winApplied) {
+                      Activity a = feedActivity != null ? feedActivity.get() : null;
+                      if (a != null && winBgSaved != null) a.getWindow().setBackgroundDrawable(winBgSaved);
+                      winApplied = false;
+                  }
+              }
+          
               // ================= 底栏 =================
           
               private static void applyBar(View decor, View pager, int W, int H, long now) {
@@ -1172,6 +1259,7 @@ jobs:
                       barTransparent = sp.getBoolean("barTransparent", true);
                       barHide = sp.getBoolean("barHide", false);
                       seamFix = sp.getBoolean("seamFix", true);
+                      pureBlack = sp.getBoolean("pureBlack", false);
                   } catch (Throwable ignored) { }
               }
           
@@ -1183,6 +1271,7 @@ jobs:
                               .putBoolean("barTransparent", barTransparent)
                               .putBoolean("barHide", barHide)
                               .putBoolean("seamFix", seamFix)
+                              .putBoolean("pureBlack", pureBlack)
                               .apply();
                   } catch (Throwable ignored) { }
               }
@@ -1329,6 +1418,14 @@ jobs:
                                   }
                               });
           
+                      addSwitch(a, root, "底栏区域纯黑（把灰色改成黑色，不缩放视频）", pureBlack,
+                              new CompoundButton.OnCheckedChangeListener() {
+                                  @Override
+                                  public void onCheckedChanged(CompoundButton b, boolean c) {
+                                      pureBlack = c;
+                                      saveCfg(a);
+                                  }
+                              });
                       addSwitch(a, root, "接缝黑边/底部补色（实验）", seamFix,
                               new CompoundButton.OnCheckedChangeListener() {
                                   @Override
@@ -1351,6 +1448,7 @@ jobs:
                               + "\n横屏等页结构：" + diagLandItem
                               + "\n接缝黑边：" + diagCorner
                               + "\n底部补色：" + diagFill
+                              + "\n纯黑：" + diagBlack
                               + "\n底栏：" + diagBar
                               + "\n底栏处理：" + diagBarState
                               + "\n运行：回调 " + runCount + " 次，首页可见 " + visibleCount
