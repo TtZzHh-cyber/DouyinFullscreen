@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 8
-                  versionName '1.7'
+                  versionCode 9
+                  versionName '1.8'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -183,6 +183,8 @@ jobs:
               private static final ArrayList<WeakReference<View>> corners = new ArrayList<>();
               private static final ArrayList<Float> cornerAlphas = new ArrayList<>();
               private static long lastCornerScan = 0;
+              private static final WeakHashMap<View, ArrayList<View>> bgCache = new WeakHashMap<>();
+              private static final WeakHashMap<View, Boolean> stretched = new WeakHashMap<>();
               private static long lastDescribeL = 0;
               private static String diagCorner = "-";
               private static String diagFill = "-";
@@ -547,7 +549,7 @@ jobs:
                               treeStr(item, 3, sb);
                               diagOtherItem = sb.toString();
                           }
-                          updateFill(item, rw, rh, gap, n > 0, scanCover);
+                          fillBottom(item, rw, rh, gap, n > 0, scanCover);
                           if (n > 0) {
                               handled++;
                               why = "非视频页，已有 " + n + " 个媒体控件铺满";
@@ -595,7 +597,7 @@ jobs:
                       }
                       setCover(container, s, ty);
                       if (cover != null) setCover(cover, s, ty);
-                      updateFill(item, rw, rh, gap, covered, scanCover);
+                      fillBottom(item, rw, rh, gap, covered, scanCover);
                       if (!covered && i == curIdx && now - lastDescribeL >= 1000) {
                           lastDescribeL = now;
                           StringBuilder sbl = new StringBuilder();
@@ -725,6 +727,16 @@ jobs:
               }
           
               private static void resetCover() {
+                  if (!stretched.isEmpty()) {
+                      for (View v : stretched.keySet()) {
+                          if (v != null) {
+                              v.setScaleY(1f);
+                              v.setPivotY(v.getHeight() / 2f);
+                          }
+                      }
+                      stretched.clear();
+                  }
+                  bgCache.clear();
                   if (!fills.isEmpty()) {
                       for (Map.Entry<View, ColorDrawable> e : fills.entrySet()) {
                           View v = e.getKey();
@@ -755,6 +767,64 @@ jobs:
                       }
                   }
                   touched.clear();
+              }
+          
+              private static void collectBgImages(View v, int depth, int w, int h, ArrayList<View> out) {
+                  if (out.size() >= 3) return;
+                  if (v instanceof ImageView && v.getVisibility() == View.VISIBLE
+                          && v.getWidth() >= 0.95f * w && v.getHeight() >= 0.95f * h) {
+                      out.add(v);
+                      return;
+                  }
+                  if (depth <= 0 || !(v instanceof ViewGroup)) return;
+                  ViewGroup g = (ViewGroup) v;
+                  for (int i = 0; i < g.getChildCount(); i++) collectBgImages(g.getChildAt(i), depth - 1, w, h, out);
+              }
+          
+              /**
+               * 画面没有铺到底的页面（横屏视频等）：页面里通常有一张铺满整页的模糊背景图，
+               * 把它沿竖直方向拉伸（顶部不动），盖住底栏区域；视频本身、文案、按钮都不动。
+               * 返回是否拉伸了背景图。
+               */
+              private static boolean stretchBackground(View item, int rw, int rh, int gap, boolean covered, boolean scan) {
+                  ArrayList<View> bgs = bgCache.get(item);
+                  if (!seamFix || gap <= 0 || covered) {
+                      if (bgs != null) {
+                          for (int i = 0; i < bgs.size(); i++) {
+                              View v = bgs.get(i);
+                              if (stretched.remove(v) != null) {
+                                  v.setScaleY(1f);
+                                  v.setPivotY(v.getHeight() / 2f);
+                              }
+                          }
+                          bgCache.remove(item);
+                      }
+                      return false;
+                  }
+                  if (bgs == null || (bgs.isEmpty() && scan)) {
+                      bgs = new ArrayList<View>();
+                      collectBgImages(item, 2, rw, rh, bgs);
+                      for (int i = 0; i < bgs.size(); i++) unclipUp(bgs.get(i), item);
+                      bgCache.put(item, bgs);
+                  }
+                  if (bgs.isEmpty()) return false;
+                  float sy = (rh + gap) / (float) rh;
+                  int n = 0;
+                  for (int i = 0; i < bgs.size(); i++) {
+                      View v = bgs.get(i);
+                      if (v.getHeight() <= 0) continue;
+                      if (v.getPivotY() != 0f) v.setPivotY(0f);
+                      if (v.getScaleY() != sy) v.setScaleY(sy);
+                      stretched.put(v, Boolean.TRUE);
+                      n++;
+                  }
+                  if (n > 0) diagFill = "已向下拉伸背景图 " + n + " 个";
+                  return n > 0;
+              }
+          
+              private static void fillBottom(View item, int rw, int rh, int gap, boolean covered, boolean scan) {
+                  boolean st = stretchBackground(item, rw, rh, gap, covered, scan);
+                  updateFill(item, rw, rh, gap, covered || st, scan);
               }
           
               private static String bgTag(View v) {
