@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 7
-                  versionName '1.6'
+                  versionCode 8
+                  versionName '1.7'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -178,6 +178,15 @@ jobs:
               private static final WeakHashMap<View, Float> shiftSet = new WeakHashMap<>();
               private static final WeakHashMap<View, Float> shiftBase = new WeakHashMap<>();
               private static final WeakHashMap<View, ArrayList<View>> leafCache = new WeakHashMap<>();
+              private static volatile boolean seamFix = true;
+              private static final WeakHashMap<View, ColorDrawable> fills = new WeakHashMap<>();
+              private static final ArrayList<WeakReference<View>> corners = new ArrayList<>();
+              private static final ArrayList<Float> cornerAlphas = new ArrayList<>();
+              private static long lastCornerScan = 0;
+              private static long lastDescribeL = 0;
+              private static String diagCorner = "-";
+              private static String diagFill = "-";
+              private static String diagLandItem = "-";
               private static boolean extended = false;
               private static int barMode = 0; // 0 = 未处理，1 = 背景透明，2 = 完全隐藏
               private static final ArrayList<WeakReference<View>> bars = new ArrayList<>();
@@ -292,6 +301,7 @@ jobs:
                       if (now - lastVisibleTime > 600) {
                           restoreBar();
                           resetCover();
+                          restoreCorners();
                       }
                       if (now - lastScan >= 500) {
                           lastScan = now;
@@ -315,6 +325,10 @@ jobs:
                   else revertExtend(pager);
                   if (coverVideo) applyCover(pager, H, now);
                   else resetCover();
+                  pager.getLocationInWindow(tmpLoc);
+                  int gapNow = H - (tmpLoc[1] + pager.getHeight());
+                  fixSeam(decor, W, H, tmpLoc[1] + pager.getHeight(),
+                          (gapNow >= 2 && gapNow <= 0.10f * H) ? gapNow : 0, now);
                   applyBar(decor, pager, W, H, now);
                   return relayout;
               }
@@ -533,9 +547,10 @@ jobs:
                               treeStr(item, 3, sb);
                               diagOtherItem = sb.toString();
                           }
+                          updateFill(item, rw, rh, gap, n > 0, scanCover);
                           if (n > 0) {
                               handled++;
-                              why = "非视频页，放大了 " + n + " 个媒体控件";
+                              why = "非视频页，已有 " + n + " 个媒体控件铺满";
                           }
                           continue;
                       }
@@ -553,22 +568,40 @@ jobs:
           
                       float s = 1f;
                       float ty = 0f;
+                      boolean covered = false;
                       if (iw > 0 && ih > 0 && iw < ih * 0.9f) { // 只处理竖屏视频，横屏视频保持原样
                           float want = Math.max((float) rw / iw, (rh + gap) / (float) ih);
-                          if (want > 1.01f && want <= 1.35f) {
-                              s = want;
-                              ty = gap / 2f;
-                              why = "已放大";
-                          } else if (want > 1.35f) {
-                              why = "视频比例差异过大，未放大（需要 " + String.format(Locale.US, "%.2f", want) + " 倍）";
+                          if (want <= 1.35f) {
+                              s = Math.max(want, 1f);
+                              // 以容器中心为轴缩放，再平移到刚好盖住页面底部；
+                              // 视频本身比页面高且居中时，也能补上被裁掉的那一截（否则底部会留黑边）
+                              float pivot = topIn(container, item) + container.getHeight() / 2f;
+                              float top0 = topIn(inner, item);
+                              float top1 = pivot + (top0 - pivot) * s;
+                              float bot1 = pivot + (top0 + ih - pivot) * s;
+                              float lo = (rh + gap) - bot1; // 至少平移这么多才能盖住底部
+                              float hi = -top1;             // 至多平移这么多才不露出顶部
+                              ty = 0f;
+                              if (lo > ty) ty = lo;
+                              if (ty > hi) ty = hi;
+                              if (Math.abs(ty) < 0.5f) ty = 0f;
+                              covered = true;
+                              why = (s > 1.01f || ty != 0f) ? "已放大/对齐" : "视频已经铺满，无需调整";
                           } else {
-                              why = "视频已经铺满，无需放大";
+                              why = "视频比例差异过大，未放大（需要 " + String.format(Locale.US, "%.2f", want) + " 倍）";
                           }
                       } else {
                           why = "横屏或方形视频，保持原样";
                       }
                       setCover(container, s, ty);
                       if (cover != null) setCover(cover, s, ty);
+                      updateFill(item, rw, rh, gap, covered, scanCover);
+                      if (!covered && i == curIdx && now - lastDescribeL >= 1000) {
+                          lastDescribeL = now;
+                          StringBuilder sbl = new StringBuilder();
+                          treeStr(item, 3, sbl);
+                          diagLandItem = sbl.toString();
+                      }
                       handled++;
                       shown = s;
                   }
@@ -634,19 +667,19 @@ jobs:
                           ty = gap / 2f;
                       }
                       setCover(l, s, ty);
-                      if (s > 1f) n++;
+                      if (s > 1f || topIn(l, item) + lh >= rh + gap - 2) n++;
                   }
                   return n;
               }
           
               private static void treeStr(View v, int depth, StringBuilder sb) {
-                  if (sb.length() > 900) return;
+                  if (sb.length() > 1300) return;
                   sb.append(shortName(v));
                   if (v.getVisibility() == View.GONE) {
                       sb.append("(隐)");
                       return;
                   }
-                  sb.append(' ').append(v.getWidth()).append('x').append(v.getHeight());
+                  sb.append(' ').append(v.getWidth()).append('x').append(v.getHeight()).append(bgTag(v));
                   if (depth > 0 && v instanceof ViewGroup) {
                       ViewGroup g = (ViewGroup) v;
                       int n = Math.min(g.getChildCount(), 10);
@@ -664,7 +697,7 @@ jobs:
                   Float prev = touched.get(v);
                   float cur = v.getScaleX();
                   if (cur != 1f && (prev == null || cur != prev)) return; // 别处（如双指缩放）正在改，不干预
-                  if (s == 1f && prev == null) return;
+                  if (s == 1f && ty == 0f && prev == null) return;
                   if (cur != s) {
                       v.setScaleX(s);
                       v.setScaleY(s);
@@ -692,6 +725,13 @@ jobs:
               }
           
               private static void resetCover() {
+                  if (!fills.isEmpty()) {
+                      for (Map.Entry<View, ColorDrawable> e : fills.entrySet()) {
+                          View v = e.getKey();
+                          if (v != null && e.getValue() != null) v.getOverlay().remove(e.getValue());
+                      }
+                      fills.clear();
+                  }
                   if (!shiftSet.isEmpty()) {
                       for (Map.Entry<View, Float> e : shiftSet.entrySet()) {
                           View v = e.getKey();
@@ -715,6 +755,150 @@ jobs:
                       }
                   }
                   touched.clear();
+              }
+          
+              private static String bgTag(View v) {
+                  Drawable d = v.getBackground();
+                  if (d == null) return "";
+                  if (d instanceof ColorDrawable) return "[底色#" + Integer.toHexString(((ColorDrawable) d).getColor()) + "]";
+                  return "[背景]";
+              }
+          
+              /** v 在 root 坐标系里的顶部位置（只累加布局位置，不含缩放/平移，所以不受我们自己改动的影响） */
+              private static float topIn(View v, View root) {
+                  float t = 0f;
+                  View cur = v;
+                  int guard = 0;
+                  while (cur != null && cur != root && guard++ < 12) {
+                      t += cur.getTop();
+                      ViewParent pp = cur.getParent();
+                      cur = pp instanceof View ? (View) pp : null;
+                  }
+                  return t;
+              }
+          
+              private static void scanColor(View v, View item, int rw, int rh, int depth, int[] bestH, Integer[] best) {
+                  if (v.getVisibility() != View.VISIBLE) return;
+                  if (v != item) {
+                      Drawable d = v.getBackground();
+                      int h = v.getHeight();
+                      if (d instanceof ColorDrawable && v.getWidth() >= 0.9f * rw && h >= 20 && h < bestH[0]) {
+                          int c = ((ColorDrawable) d).getColor();
+                          if (Color.alpha(c) >= 200 && topIn(v, item) + h >= rh - 2) {
+                              bestH[0] = h;
+                              best[0] = c;
+                          }
+                      }
+                  }
+                  if (depth < 6 && v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) scanColor(g.getChildAt(i), item, rw, rh, depth + 1, bestH, best);
+                  }
+              }
+          
+              /**
+               * 画面没有铺到底的页面（横屏视频、图文等）：用页面底部那块通栏控件的底色，
+               * 在页面下方补一条同色条，避免底栏区域露出黑色。
+               */
+              private static void updateFill(View item, int rw, int rh, int gap, boolean covered, boolean scan) {
+                  ColorDrawable fd = fills.get(item);
+                  if (!seamFix || gap <= 0 || covered) {
+                      if (fd != null) {
+                          item.getOverlay().remove(fd);
+                          fills.remove(item);
+                      }
+                      return;
+                  }
+                  if (!scan) {
+                      if (fd != null) fd.setBounds(0, rh, rw, rh + gap);
+                      return;
+                  }
+                  int[] bestH = {Integer.MAX_VALUE};
+                  Integer[] best = new Integer[1];
+                  scanColor(item, item, rw, rh, 0, bestH, best);
+                  if (best[0] == null) {
+                      if (fd != null) {
+                          item.getOverlay().remove(fd);
+                          fills.remove(item);
+                      }
+                      diagFill = "没找到可参考的底色（页面底部是黑色）";
+                      return;
+                  }
+                  int color = best[0];
+                  if (fd == null) {
+                      fd = new ColorDrawable(color);
+                      item.getOverlay().add(fd);
+                      fills.put(item, fd);
+                  } else if (fd.getColor() != color) {
+                      fd.setColor(color);
+                  }
+                  fd.setBounds(0, rh, rw, rh + gap);
+                  diagFill = "已补底色 #" + Integer.toHexString(color);
+              }
+          
+              // ---- 视频区域与原底栏衔接处的黑色小圆角/黑边 ----
+          
+              private static void scanCorners(View v, int W, int J, ArrayList<View> out) {
+                  if (v.getVisibility() != View.VISIBLE || out.size() >= 6) return;
+                  int w = v.getWidth();
+                  int h = v.getHeight();
+                  boolean leaf = !(v instanceof ViewGroup) || ((ViewGroup) v).getChildCount() == 0;
+                  if (w > 0 && h > 0 && leaf && !(v instanceof TextView)) {
+                      boolean small = w <= 120 && h <= 120;
+                      boolean thin = w >= 0.9f * W && h <= 70;
+                      if (small || thin) {
+                          v.getLocationInWindow(tmpLoc);
+                          int cy = tmpLoc[1] + h / 2;
+                          if (Math.abs(cy - J) <= (small ? 70 : 40)) {
+                              boolean atEdge = tmpLoc[0] <= 6 || tmpLoc[0] + w >= W - 6;
+                              String n = v.getClass().getName().toLowerCase(Locale.US);
+                              boolean named = n.contains("corner") || n.contains("round") || n.contains("radius");
+                              if ((small && atEdge) || (thin && named)) {
+                                  out.add(v);
+                                  return;
+                              }
+                          }
+                      }
+                  }
+                  if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) scanCorners(g.getChildAt(i), W, J, out);
+                  }
+              }
+          
+              private static void restoreCorners() {
+                  for (int i = 0; i < corners.size(); i++) {
+                      View v = corners.get(i).get();
+                      if (v != null) v.setAlpha(i < cornerAlphas.size() ? cornerAlphas.get(i) : 1f);
+                  }
+                  corners.clear();
+                  cornerAlphas.clear();
+              }
+          
+              private static void fixSeam(View decor, int W, int H, int J, int gap, long now) {
+                  if (!seamFix || gap <= 0) {
+                      restoreCorners();
+                      return;
+                  }
+                  if (now - lastCornerScan >= 700) {
+                      lastCornerScan = now;
+                      ArrayList<View> found = new ArrayList<View>();
+                      scanCorners(decor, W, J, found);
+                      restoreCorners();
+                      StringBuilder sb = new StringBuilder();
+                      for (int i = 0; i < found.size(); i++) {
+                          View v = found.get(i);
+                          corners.add(new WeakReference<View>(v));
+                          cornerAlphas.add(v.getAlpha());
+                          if (i > 0) sb.append("；");
+                          sb.append(shortName(v)).append(' ').append(v.getWidth()).append('x').append(v.getHeight());
+                      }
+                      diagCorner = found.isEmpty() ? "没找到可疑的小控件" : found.size() + " 个已隐藏：" + sb;
+                  }
+                  for (int i = 0; i < corners.size(); i++) {
+                      View v = corners.get(i).get();
+                      if (v != null && v.getAlpha() != 0f) v.setAlpha(0f);
+                  }
               }
           
               // ================= 底栏 =================
@@ -916,6 +1100,7 @@ jobs:
                       coverVideo = sp.getBoolean("coverVideo", true);
                       barTransparent = sp.getBoolean("barTransparent", true);
                       barHide = sp.getBoolean("barHide", false);
+                      seamFix = sp.getBoolean("seamFix", true);
                   } catch (Throwable ignored) { }
               }
           
@@ -926,6 +1111,7 @@ jobs:
                               .putBoolean("coverVideo", coverVideo)
                               .putBoolean("barTransparent", barTransparent)
                               .putBoolean("barHide", barHide)
+                              .putBoolean("seamFix", seamFix)
                               .apply();
                   } catch (Throwable ignored) { }
               }
@@ -1072,6 +1258,15 @@ jobs:
                                   }
                               });
           
+                      addSwitch(a, root, "接缝黑边/底部补色（实验）", seamFix,
+                              new CompoundButton.OnCheckedChangeListener() {
+                                  @Override
+                                  public void onCheckedChanged(CompoundButton b, boolean c) {
+                                      seamFix = c;
+                                      saveCfg(a);
+                                  }
+                              });
+          
                       TextView tip = new TextView(a);
                       tip.setText("回到首页即生效。使用本模块时，请关闭其他模块里的全屏、隐藏底栏等功能，避免互相冲突。"
                               + "\n\n【状态】（效果不对时请截图本面板）"
@@ -1082,6 +1277,9 @@ jobs:
                               + "\n布局拉伸：" + diagFix
                               + "\n视频页结构：" + diagVideoItem
                               + "\n其他页（如直播）结构：" + diagOtherItem
+                              + "\n横屏等页结构：" + diagLandItem
+                              + "\n接缝黑边：" + diagCorner
+                              + "\n底部补色：" + diagFill
                               + "\n底栏：" + diagBar
                               + "\n底栏处理：" + diagBarState
                               + "\n运行：回调 " + runCount + " 次，首页可见 " + visibleCount
