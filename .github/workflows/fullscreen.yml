@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinfullscreen'
                   minSdk 24
                   targetSdk 34
-                  versionCode 10
-                  versionName '1.9'
+                  versionCode 11
+                  versionName '2.0'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -100,7 +100,6 @@ jobs:
           import android.graphics.drawable.ColorDrawable;
           import android.graphics.drawable.Drawable;
           import android.graphics.drawable.GradientDrawable;
-          import android.os.Build;
           import android.os.SystemClock;
           import android.view.Gravity;
           import android.view.View;
@@ -125,102 +124,75 @@ jobs:
           
           import de.robv.android.xposed.IXposedHookLoadPackage;
           import de.robv.android.xposed.XC_MethodHook;
-          import de.robv.android.xposed.XposedBridge;
           import de.robv.android.xposed.XposedHelpers;
           import de.robv.android.xposed.callbacks.XC_LoadPackage;
           
           /**
-           * 抖音首页视频流铺满全屏：
-           * 1. 把首页视频翻页控件（RTViewPager）向下延伸到屏幕底部；
-           * 2. 底部标签栏设为透明（仍可点击）。
-           * 所有改动在绘制前一次完成，不会在翻页过程中改变布局，避免黑屏闪烁。
+           * 抖音首页全屏：
+           * 1. 画面铺满：只放大视频画面，让它盖住底栏区域，文案和按钮位置不变；
+           * 2. 底栏背景透明 / 完全隐藏（位置仍可点击）；
+           * 3. 底栏区域纯黑；
+           * 4. 接缝黑边处理与底部补色。
+           * 设置入口在抖音「设置」页底部。所有改动都在绘制前完成。
            */
           public class MainHook implements IXposedHookLoadPackage {
           
               private static final String PKG = "com.ss.android.ugc.aweme";
-              private static final String TAG = "[DouyinFullscreen] ";
               private static final String PREF = "douyin_fullscreen_cfg";
               private static final String ENTRY_TAG = "dfs_entry";
               private static final String PAGER_CLASS = "com.ss.android.ugc.aweme.common.widget.RTViewPager";
               private static final String[] MARKERS = {"账号与安全", "隐私设置", "通用设置"};
           
-              private static final int UNSET = Integer.MIN_VALUE;
-          
-              private static volatile boolean fullscreen = false;
+              // ---- 设置 ----
               private static volatile boolean coverVideo = true;
               private static volatile boolean barTransparent = true;
               private static volatile boolean barHide = false;
+              private static volatile boolean seamFix = true;
+              private static volatile boolean pureBlack = false;
               private static boolean cfgLoaded = false;
               private static boolean menuShowing = false;
           
               // ---- 首页状态（仅在主线程使用）----
               private static WeakReference<View> listenerDecor;
               private static WeakReference<View> pagerRef;
+              private static WeakReference<Activity> feedActivity;
               private static final Rect tmpRect = new Rect();
               private static final int[] tmpLoc = new int[2];
               private static long lastScan = 0;
-              private static long lastBarScan = 0;
-              private static long lastCancel = 0;
-              private static int cancels = 0;
-              private static int heightTries = 0;
-              private static int strategy = 0; // 0 = 改下边距，1 = 改固定高度
-              private static int origMargin = UNSET;
-              private static int origHeight = UNSET;
-              private static int lastGap = UNSET;
-              private static boolean failed = false;
-              private static boolean unclipped = false;
               private static long lastVisibleTime = 0;
               private static long lastPartScan = 0;
+              private static long lastCornerScan = 0;
+              private static long lastBlackScan = 0;
+              private static long lastBarScan = 0;
               private static int scanMiss = 0;
+              private static boolean unclipped = false;
+          
+              // 画面铺满
               private static final WeakHashMap<View, View[]> itemParts = new WeakHashMap<>();
               private static final WeakHashMap<View, Float> touched = new WeakHashMap<>();
-              private static long lastDescribe = 0;
-              private static long lastDescribeO = 0;
               private static final WeakHashMap<View, Float> shiftSet = new WeakHashMap<>();
               private static final WeakHashMap<View, Float> shiftBase = new WeakHashMap<>();
               private static final WeakHashMap<View, ArrayList<View>> leafCache = new WeakHashMap<>();
-              private static volatile boolean seamFix = true;
-              private static final WeakHashMap<View, ColorDrawable> fills = new WeakHashMap<>();
-              private static final ArrayList<WeakReference<View>> corners = new ArrayList<>();
-              private static final ArrayList<Float> cornerAlphas = new ArrayList<>();
-              private static long lastCornerScan = 0;
-              private static volatile boolean pureBlack = false;
-              private static WeakReference<Activity> feedActivity;
-              private static final ArrayList<WeakReference<View>> blackViews = new ArrayList<>();
-              private static final ArrayList<Drawable> blackSaved = new ArrayList<>();
-              private static long lastBlackScan = 0;
-              private static boolean winApplied = false;
-              private static Drawable winBgSaved;
-              private static String diagBlack = "-";
               private static final WeakHashMap<View, ArrayList<View>> bgCache = new WeakHashMap<>();
               private static final WeakHashMap<View, Boolean> stretched = new WeakHashMap<>();
-              private static long lastDescribeL = 0;
-              private static String diagCorner = "-";
-              private static String diagFill = "-";
-              private static String diagLandItem = "-";
-              private static boolean extended = false;
+              private static final WeakHashMap<View, ColorDrawable> fills = new WeakHashMap<>();
+          
+              // 接缝小控件
+              private static final ArrayList<WeakReference<View>> corners = new ArrayList<>();
+              private static final ArrayList<Float> cornerAlphas = new ArrayList<>();
+          
+              // 底栏
               private static int barMode = 0; // 0 = 未处理，1 = 背景透明，2 = 完全隐藏
               private static final ArrayList<WeakReference<View>> bars = new ArrayList<>();
-              private static int barGap = 0;
               private static final ArrayList<Float> barAlphas = new ArrayList<>();
               private static final ArrayList<WeakReference<View>> bgViews = new ArrayList<>();
               private static final ArrayList<Drawable> bgSaved = new ArrayList<>();
           
-              // ---- 状态说明（显示在设置面板里，方便排查）----
-              private static String diagPager = "尚未进入首页（或控件类名已变化）";
-              private static String diagGap = "-";
-              private static String diagFix = "-";
-              private static String diagBar = "-";
-              private static String diagCover = "-";
-              private static String diagVideoItem = "-";
-              private static String diagOtherItem = "-";
-              private static String diagBarState = "-";
-              private static String diagErr = "无";
-              private static String lastPagerInfo = null;
-              private static boolean inFeed = false;
-              private static int runCount = 0;
-              private static int visibleCount = 0;
-              private static int applyCount = 0;
+              // 纯黑
+              private static final ArrayList<WeakReference<View>> blackViews = new ArrayList<>();
+              private static final ArrayList<Drawable> blackSaved = new ArrayList<>();
+              private static boolean winApplied = false;
+              private static Drawable winBgSaved;
           
               @Override
               public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -237,17 +209,13 @@ jobs:
                                   } else {
                                       scheduleEntryCheck(a);
                                   }
-                              } catch (Throwable t) {
-                                  XposedBridge.log(TAG + "onResume 处理失败: " + t);
-                              }
+                              } catch (Throwable ignored) { }
                           }
                       });
-                  } catch (Throwable t) {
-                      XposedBridge.log(TAG + "hook onResume 失败: " + t);
-                  }
+                  } catch (Throwable ignored) { }
               }
           
-              // ================= 首页铺满 =================
+              // ================= 首页 =================
           
               private static void attachFeedListener(Activity a) {
                   final View decor = a.getWindow().getDecorView();
@@ -255,10 +223,8 @@ jobs:
                   if (listenerDecor != null && listenerDecor.get() == decor) return;
                   listenerDecor = new WeakReference<View>(decor);
                   pagerRef = null;
+                  unclipped = false;
                   restoreBar();
-                  resetState();
-          
-                  if (fullscreen) makeNavBarTransparent(a);
           
                   ViewTreeObserver vto = decor.getViewTreeObserver();
                   if (!vto.isAlive()) return;
@@ -266,50 +232,23 @@ jobs:
                       @Override
                       public boolean onPreDraw() {
                           try {
-                              // 返回 false 会取消本帧绘制并立即重新布局，使改动在同一帧生效，不会闪烁
-                              return !feedFix(decor);
-                          } catch (Throwable t) {
-                              StackTraceElement[] st = t.getStackTrace();
-                              diagErr = t + (st.length > 0 ? " @" + st[0].getMethodName() + ":" + st[0].getLineNumber() : "");
-                              return true;
-                          }
+                              feedFix(decor);
+                          } catch (Throwable ignored) { }
+                          return true;
                       }
                   });
               }
           
-              private static void makeNavBarTransparent(Activity a) {
-                  try {
-                      Window w = a.getWindow();
-                      w.setNavigationBarColor(Color.TRANSPARENT);
-                      if (Build.VERSION.SDK_INT >= 29) w.setNavigationBarContrastEnforced(false);
-                  } catch (Throwable ignored) { }
-              }
-          
-              private static void resetState() {
-                  failed = false;
-                  strategy = 0;
-                  origMargin = UNSET;
-                  origHeight = UNSET;
-                  cancels = 0;
-                  heightTries = 0;
-                  extended = false;
-                  lastGap = UNSET;
-                  unclipped = false;
-              }
-          
-              /** 每帧绘制前调用：返回 true 表示改动了布局，需要取消本帧绘制并重新布局 */
-              private static boolean feedFix(View decor) {
-                  runCount++;
+              /** 每帧绘制前调用 */
+              private static void feedFix(View decor) {
                   int W = decor.getWidth();
                   int H = decor.getHeight();
-                  if (W <= 0 || H <= 0) return false;
+                  if (W <= 0 || H <= 0) return;
                   long now = SystemClock.uptimeMillis();
           
                   View pager = pagerRef != null ? pagerRef.get() : null;
                   if (pager == null || pager.getWindowToken() == null || !isFeedVisible(pager, W, H)) {
-                      // 不在首页视频流（或视频流还没出现）：恢复底栏，并低频重新寻找视频流
-                      inFeed = false;
-                      // 短暂不可见（换视频、刷新）时不恢复底栏，避免底部闪一下；持续不在首页才恢复
+                      // 短暂不可见（换视频、刷新）时不恢复，避免底部闪一下；持续不在首页才恢复
                       if (now - lastVisibleTime > 600) {
                           restoreBar();
                           resetCover();
@@ -321,128 +260,26 @@ jobs:
                           View found = findFeedPager(decor, W, H);
                           if (found != pager) {
                               pagerRef = found == null ? null : new WeakReference<View>(found);
-                              resetState();
-                              if (found != null) {
-                                  lastPagerInfo = shortName(found) + " " + found.getWidth() + "x" + found.getHeight();
-                              }
+                              unclipped = false;
                           }
                       }
-                      return false;
+                      return;
                   }
           
-                  inFeed = true;
                   lastVisibleTime = now;
-                  visibleCount++;
-                  boolean relayout = false;
-                  if (fullscreen) relayout = extend(pager, H, now);
-                  else revertExtend(pager);
                   if (coverVideo) applyCover(pager, H, now);
                   else resetCover();
                   pager.getLocationInWindow(tmpLoc);
-                  int gapNow = H - (tmpLoc[1] + pager.getHeight());
-                  fixSeam(decor, W, H, tmpLoc[1] + pager.getHeight(),
-                          (gapNow >= 2 && gapNow <= 0.10f * H) ? gapNow : 0, now);
+                  int pagerBottom = tmpLoc[1] + pager.getHeight();
+                  fixSeam(decor, W, pagerBottom, gapOf(H, pagerBottom), now);
                   applyBar(decor, pager, W, H, now);
                   applyPureBlack(decor, pager, W, H, now);
-                  return relayout;
               }
           
-              /** 把视频流向下延伸到屏幕底边；先尝试改下边距，无效再改成固定高度 */
-              private static boolean extend(View pager, int H, long now) {
-                  pager.getLocationInWindow(tmpLoc);
-                  int gap = H - (tmpLoc[1] + pager.getHeight());
-                  if (gap != lastGap) {
-                      lastGap = gap;
-                      diagGap = gap + " px（窗口高 " + H + "）";
-                  }
-                  if (gap < 2) {
-                      cancels = 0;
-                      heightTries = 0;
-                      diagFix = extended ? "已铺满（" + (strategy == 0 ? "边距法" : "定高法") + "）"
-                              : "无需调整（已经铺满）";
-                      return false;
-                  }
-                  if (failed || gap < 0.02f * H || gap > 0.10f * H) return false;
-                  if (cancels >= 3 && now - lastCancel < 2000) return false; // 防止死循环
-                  if (cancels >= 3) cancels = 0;
-          
-                  ViewGroup.LayoutParams lp = pager.getLayoutParams();
-                  if (lp == null) {
-                      failed = true;
-                      diagFix = "失败：视频流没有布局参数";
-                      return false;
-                  }
-                  if (origHeight == UNSET) origHeight = lp.height;
-                  if (origMargin == UNSET && lp instanceof ViewGroup.MarginLayoutParams) {
-                      origMargin = ((ViewGroup.MarginLayoutParams) lp).bottomMargin;
-                  }
-          
-                  if (strategy == 0) {
-                      if (!(lp instanceof ViewGroup.MarginLayoutParams) || origMargin == UNSET) {
-                          strategy = 1;
-                          return false;
-                      }
-                      ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-                      if (origMargin - (m.bottomMargin - gap) > 0.12f * H) {
-                          // 累计调整过大，说明边距不起作用：还原并改用定高法
-                          m.bottomMargin = origMargin;
-                          strategy = 1;
-                          cancels = 0;
-                          pager.setLayoutParams(m);
-                          diagFix = "边距法无效，改用定高法";
-                      } else {
-                          m.bottomMargin -= gap;
-                          pager.setLayoutParams(m);
-                          diagFix = "边距法调整中";
-                      }
-                  } else {
-                      if (heightTries >= 3) {
-                          failed = true;
-                          restoreLp(pager);
-                          diagFix = "失败：布局不响应调整（视频流布局：" + describeLp(lp) + "）";
-                          return true;
-                      }
-                      heightTries++;
-                      lp.height = pager.getHeight() + gap;
-                      pager.setLayoutParams(lp);
-                      diagFix = "定高法调整中";
-                  }
-                  extended = true;
-                  cancels++;
-                  lastCancel = now;
-                  return true;
-              }
-          
-              private static void restoreLp(View pager) {
-                  ViewGroup.LayoutParams lp = pager.getLayoutParams();
-                  if (lp == null) return;
-                  if (origHeight != UNSET) lp.height = origHeight;
-                  if (origMargin != UNSET && lp instanceof ViewGroup.MarginLayoutParams) {
-                      ((ViewGroup.MarginLayoutParams) lp).bottomMargin = origMargin;
-                  }
-                  pager.setLayoutParams(lp);
-              }
-          
-              private static void revertExtend(View pager) {
-                  if (!extended) return;
-                  restoreLp(pager);
-                  resetState();
-                  diagFix = "已关闭";
-              }
-          
-              private static String describeLp(ViewGroup.LayoutParams lp) {
-                  String n = lp.getClass().getName();
-                  n = n.substring(n.lastIndexOf('.') + 1);
-                  String r = n + " h=" + lp.height;
-                  if (lp instanceof ViewGroup.MarginLayoutParams) {
-                      r += " 下边距=" + ((ViewGroup.MarginLayoutParams) lp).bottomMargin;
-                  }
-                  return r;
-              }
-          
-              private static String shortName(View v) {
-                  String n = v.getClass().getName();
-                  return n.substring(n.lastIndexOf('.') + 1);
+              /** 视频流底边到屏幕底边的缺口（即原底栏占的高度），不在合理范围内则当作没有 */
+              private static int gapOf(int H, int pagerBottom) {
+                  int g = H - pagerBottom;
+                  return (g >= 2 && g <= 0.10f * H) ? g : 0;
               }
           
               private static boolean isFeedVisible(View pager, int W, int H) {
@@ -487,8 +324,21 @@ jobs:
                   }
               }
           
+              /** v 在 root 坐标系里的顶部位置（只累加布局位置，不含缩放/平移，所以不受我们自己改动的影响） */
+              private static float topIn(View v, View root) {
+                  float t = 0f;
+                  View cur = v;
+                  int guard = 0;
+                  while (cur != null && cur != root && guard++ < 12) {
+                      t += cur.getTop();
+                      ViewParent pp = cur.getParent();
+                      cur = pp instanceof View ? (View) pp : null;
+                  }
+                  return t;
+              }
+          
               /**
-               * 只对视频画面（VideoPinchViewContainer 及封面）做缩放，让竖屏视频铺满到屏幕底部；
+               * 只对视频画面（VideoPinchViewContainer 及封面）做缩放/平移，让视频盖住底栏区域；
                * 文案、按钮、进度条等不做任何改动，所以位置完全不变。
                */
               private static void applyCover(View pager, int H, long now) {
@@ -496,39 +346,21 @@ jobs:
                   ViewGroup pg = (ViewGroup) pager;
                   pager.getLocationInWindow(tmpLoc);
                   int pagerTop = tmpLoc[1];
-                  int pagerBottom = pagerTop + pager.getHeight();
-                  int gapPx = H - pagerBottom;
-                  int gap = (gapPx >= 2 && gapPx <= 0.10f * H) ? gapPx : 0;
+                  int gap = gapOf(H, pagerTop + pager.getHeight());
                   if (gap > 0 && !unclipped) {
                       pg.setClipChildren(false);
                       unclipUp(pager, null);
                       unclipped = true;
                   }
           
-                  // 当前页（与视频流可见区域重叠最多的那一页），仅用于显示结构信息
-                  int curIdx = -1;
-                  int bestOv = Integer.MIN_VALUE;
-                  for (int i = 0; i < pg.getChildCount(); i++) {
-                      View it = pg.getChildAt(i);
-                      it.getLocationInWindow(tmpLoc);
-                      int ov = Math.min(tmpLoc[1] + it.getHeight(), pagerBottom) - Math.max(tmpLoc[1], pagerTop);
-                      if (ov > bestOv) {
-                          bestOv = ov;
-                          curIdx = i;
-                      }
-                  }
+                  boolean scan = now - lastPartScan >= 250;
+                  if (scan) lastPartScan = now;
           
-                  boolean scanCover = now - lastPartScan >= 250;
-                  if (scanCover) lastPartScan = now;
-          
-                  int handled = 0;
-                  float shown = 1f;
-                  String why = "页面里没有找到视频画面控件";
                   for (int i = 0; i < pg.getChildCount(); i++) {
                       View item = pg.getChildAt(i);
-                      if (item.getWidth() <= 0 || item.getHeight() <= 0) continue;
                       int rw = item.getWidth();
                       int rh = item.getHeight();
+                      if (rw <= 0 || rh <= 0) continue;
           
                       // 间距补偿：每页按它离视频流顶部的距离做平移，让页与页之间的视觉间距等于「页高+缺口」，
                       // 这样每页伸进底栏区域的画面刚好接上下一页，翻页全程没有黑条，也不会露出相邻页。
@@ -548,34 +380,18 @@ jobs:
                               unclipUp(c, item);
                           }
                       }
-                      if (parts[1] == null && scanCover) parts[1] = findPart(item, ".CoverImageView", 9);
+                      if (parts[1] == null && scan) parts[1] = findPart(item, ".CoverImageView", 9);
                       View container = parts[0];
                       View cover = parts[1];
           
                       if (container == null) {
                           // 不是普通视频页（如直播页）：把页面里铺满的大图/视频控件放大，文字按钮等小控件不动
-                          int n = scaleMediaLeaves(item, rw, rh, gap, scanCover);
-                          if (i == curIdx && now - lastDescribeO >= 1000) {
-                              lastDescribeO = now;
-                              StringBuilder sb = new StringBuilder();
-                              treeStr(item, 3, sb);
-                              diagOtherItem = sb.toString();
-                          }
-                          fillBottom(item, rw, rh, gap, n > 0, scanCover);
-                          if (n > 0) {
-                              handled++;
-                              why = "非视频页，已有 " + n + " 个媒体控件铺满";
-                          }
+                          int n = scaleMediaLeaves(item, rw, rh, gap, scan);
+                          fillBottom(item, rw, rh, gap, n > 0, scan);
                           continue;
                       }
-                      if (i == curIdx && now - lastDescribe >= 1000) {
-                          lastDescribe = now;
-                          diagVideoItem = describeItem(item);
-                      }
-                      if (!(container instanceof ViewGroup) || ((ViewGroup) container).getChildCount() == 0) {
-                          why = "视频画面控件里没有内容";
-                          continue;
-                      }
+                      if (!(container instanceof ViewGroup) || ((ViewGroup) container).getChildCount() == 0) continue;
+          
                       View inner = ((ViewGroup) container).getChildAt(0);
                       int iw = inner.getWidth();
                       int ih = inner.getHeight();
@@ -595,31 +411,16 @@ jobs:
                               float bot1 = pivot + (top0 + ih - pivot) * s;
                               float lo = (rh + gap) - bot1; // 至少平移这么多才能盖住底部
                               float hi = -top1;             // 至多平移这么多才不露出顶部
-                              ty = 0f;
                               if (lo > ty) ty = lo;
                               if (ty > hi) ty = hi;
                               if (Math.abs(ty) < 0.5f) ty = 0f;
                               covered = true;
-                              why = (s > 1.01f || ty != 0f) ? "已放大/对齐" : "视频已经铺满，无需调整";
-                          } else {
-                              why = "视频比例差异过大，未放大（需要 " + String.format(Locale.US, "%.2f", want) + " 倍）";
                           }
-                      } else {
-                          why = "横屏或方形视频，保持原样";
                       }
                       setCover(container, s, ty);
                       if (cover != null) setCover(cover, s, ty);
-                      fillBottom(item, rw, rh, gap, covered, scanCover);
-                      if (!covered && i == curIdx && now - lastDescribeL >= 1000) {
-                          lastDescribeL = now;
-                          StringBuilder sbl = new StringBuilder();
-                          treeStr(item, 3, sbl);
-                          diagLandItem = sbl.toString();
-                      }
-                      handled++;
-                      shown = s;
+                      fillBottom(item, rw, rh, gap, covered, scan);
                   }
-                  diagCover = handled + " 页，缩放 " + String.format(Locale.US, "%.2f", shown) + "，缺口 " + gap + "px（" + why + "）";
               }
           
               /** 让每页的视觉间距等于「页高+缺口」；topBase 去掉了我们自己上一帧加的平移，避免反馈抖动 */
@@ -686,27 +487,6 @@ jobs:
                   return n;
               }
           
-              private static void treeStr(View v, int depth, StringBuilder sb) {
-                  if (sb.length() > 1300) return;
-                  sb.append(shortName(v));
-                  if (v.getVisibility() == View.GONE) {
-                      sb.append("(隐)");
-                      return;
-                  }
-                  sb.append(' ').append(v.getWidth()).append('x').append(v.getHeight()).append(bgTag(v));
-                  if (depth > 0 && v instanceof ViewGroup) {
-                      ViewGroup g = (ViewGroup) v;
-                      int n = Math.min(g.getChildCount(), 10);
-                      if (n > 0) sb.append(" {");
-                      for (int i = 0; i < n; i++) {
-                          if (i > 0) sb.append("，");
-                          treeStr(g.getChildAt(i), depth - 1, sb);
-                      }
-                      if (g.getChildCount() > n) sb.append("…");
-                      if (n > 0) sb.append("}");
-                  }
-              }
-          
               private static void setCover(View v, float s, float ty) {
                   Float prev = touched.get(v);
                   float cur = v.getScaleX();
@@ -718,24 +498,6 @@ jobs:
                   }
                   if (v.getTranslationY() != ty) v.setTranslationY(ty);
                   touched.put(v, s);
-              }
-          
-              private static String describeItem(View item) {
-                  StringBuilder sb = new StringBuilder(shortName(item));
-                  sb.append(' ').append(item.getWidth()).append('x').append(item.getHeight()).append(" [");
-                  if (item instanceof ViewGroup) {
-                      ViewGroup g = (ViewGroup) item;
-                      int n = Math.min(g.getChildCount(), 16);
-                      for (int i = 0; i < n; i++) {
-                          View c = g.getChildAt(i);
-                          if (i > 0) sb.append("，");
-                          sb.append(shortName(c));
-                          if (c.getVisibility() == View.GONE) sb.append("(隐)");
-                          else sb.append(' ').append(c.getWidth()).append('x').append(c.getHeight());
-                      }
-                      if (g.getChildCount() > n) sb.append("…");
-                  }
-                  return sb.append(']').toString();
               }
           
               private static void resetCover() {
@@ -781,6 +543,8 @@ jobs:
                   touched.clear();
               }
           
+              // ---- 画面没有铺到底的页面（横屏视频、图文等）：补底 ----
+          
               private static void collectBgImages(View v, int depth, int w, int h, ArrayList<View> out) {
                   if (out.size() >= 3) return;
                   if (v instanceof ImageView && v.getVisibility() == View.VISIBLE
@@ -794,9 +558,8 @@ jobs:
               }
           
               /**
-               * 画面没有铺到底的页面（横屏视频等）：页面里通常有一张铺满整页的模糊背景图，
-               * 把它沿竖直方向拉伸（顶部不动），盖住底栏区域；视频本身、文案、按钮都不动。
-               * 返回是否拉伸了背景图。
+               * 页面里通常有一张铺满整页的模糊背景图，把它沿竖直方向拉伸（顶部不动），盖住底栏区域；
+               * 视频本身、文案、按钮都不动。返回是否拉伸了背景图。
                */
               private static boolean stretchBackground(View item, int rw, int rh, int gap, boolean covered, boolean scan) {
                   ArrayList<View> bgs = bgCache.get(item);
@@ -819,7 +582,6 @@ jobs:
                       for (int i = 0; i < bgs.size(); i++) unclipUp(bgs.get(i), item);
                       bgCache.put(item, bgs);
                   }
-                  if (bgs.isEmpty()) return false;
                   float sy = (rh + gap) / (float) rh;
                   int n = 0;
                   for (int i = 0; i < bgs.size(); i++) {
@@ -830,33 +592,7 @@ jobs:
                       stretched.put(v, Boolean.TRUE);
                       n++;
                   }
-                  if (n > 0) diagFill = "已向下拉伸背景图 " + n + " 个";
                   return n > 0;
-              }
-          
-              private static void fillBottom(View item, int rw, int rh, int gap, boolean covered, boolean scan) {
-                  boolean st = stretchBackground(item, rw, rh, gap, covered, scan);
-                  updateFill(item, rw, rh, gap, covered || st, scan);
-              }
-          
-              private static String bgTag(View v) {
-                  Drawable d = v.getBackground();
-                  if (d == null) return "";
-                  if (d instanceof ColorDrawable) return "[底色#" + Integer.toHexString(((ColorDrawable) d).getColor()) + "]";
-                  return "[背景]";
-              }
-          
-              /** v 在 root 坐标系里的顶部位置（只累加布局位置，不含缩放/平移，所以不受我们自己改动的影响） */
-              private static float topIn(View v, View root) {
-                  float t = 0f;
-                  View cur = v;
-                  int guard = 0;
-                  while (cur != null && cur != root && guard++ < 12) {
-                      t += cur.getTop();
-                      ViewParent pp = cur.getParent();
-                      cur = pp instanceof View ? (View) pp : null;
-                  }
-                  return t;
               }
           
               private static void scanColor(View v, View item, int rw, int rh, int depth, int[] bestH, Integer[] best) {
@@ -878,10 +614,7 @@ jobs:
                   }
               }
           
-              /**
-               * 画面没有铺到底的页面（横屏视频、图文等）：用页面底部那块通栏控件的底色，
-               * 在页面下方补一条同色条，避免底栏区域露出黑色。
-               */
+              /** 找不到背景图时：用页面底部通栏控件的底色，在页面下方补一条同色条 */
               private static void updateFill(View item, int rw, int rh, int gap, boolean covered, boolean scan) {
                   ColorDrawable fd = fills.get(item);
                   if (!seamFix || gap <= 0 || covered) {
@@ -903,7 +636,6 @@ jobs:
                           item.getOverlay().remove(fd);
                           fills.remove(item);
                       }
-                      diagFill = "没找到可参考的底色（页面底部是黑色）";
                       return;
                   }
                   int color = best[0];
@@ -915,11 +647,16 @@ jobs:
                       fd.setColor(color);
                   }
                   fd.setBounds(0, rh, rw, rh + gap);
-                  diagFill = "已补底色 #" + Integer.toHexString(color);
               }
           
-              // ---- 视频区域与原底栏衔接处的黑色小圆角/黑边 ----
+              private static void fillBottom(View item, int rw, int rh, int gap, boolean covered, boolean scan) {
+                  boolean st = stretchBackground(item, rw, rh, gap, covered, scan);
+                  updateFill(item, rw, rh, gap, covered || st, scan);
+              }
           
+              // ================= 接缝黑边 =================
+          
+              /** 视频流底边两侧的小圆角图片（贴着屏幕左右边缘的小叶子控件）会在接缝处留黑边，隐藏它们 */
               private static void scanCorners(View v, int W, int J, ArrayList<View> out) {
                   if (v.getVisibility() != View.VISIBLE || out.size() >= 6) return;
                   int w = v.getWidth();
@@ -957,7 +694,7 @@ jobs:
                   cornerAlphas.clear();
               }
           
-              private static void fixSeam(View decor, int W, int H, int J, int gap, long now) {
+              private static void fixSeam(View decor, int W, int J, int gap, long now) {
                   if (!seamFix || gap <= 0) {
                       restoreCorners();
                       return;
@@ -967,15 +704,11 @@ jobs:
                       ArrayList<View> found = new ArrayList<View>();
                       scanCorners(decor, W, J, found);
                       restoreCorners();
-                      StringBuilder sb = new StringBuilder();
                       for (int i = 0; i < found.size(); i++) {
                           View v = found.get(i);
                           corners.add(new WeakReference<View>(v));
                           cornerAlphas.add(v.getAlpha());
-                          if (i > 0) sb.append("；");
-                          sb.append(shortName(v)).append(' ').append(v.getWidth()).append('x').append(v.getHeight());
                       }
-                      diagCorner = found.isEmpty() ? "没找到可疑的小控件" : found.size() + " 个已隐藏：" + sb;
                   }
                   for (int i = 0; i < corners.size(); i++) {
                       View v = corners.get(i).get();
@@ -1041,7 +774,6 @@ jobs:
                       p = v.getParent();
                   }
                   scanBottomColors(decor, pager, W, H, 0);
-                  diagBlack = "已处理 " + blackViews.size() + " 处底色" + (winApplied ? "，窗口背景已设为黑色" : "");
               }
           
               private static void restorePureBlack() {
@@ -1083,13 +815,11 @@ jobs:
                       findBars(decor, pager, W, H);
                       if (bars.isEmpty()) {
                           scanMiss++;
-                          diagBar = "未找到底栏";
                           return;
                       }
                       scanMiss = 0;
                   }
           
-                  applyCount++;
                   if (want == 2) {
                       if (barMode != 2) {
                           barAlphas.clear();
@@ -1132,21 +862,6 @@ jobs:
                           if (v != null && v.getBackground() != null) v.setBackground(null);
                       }
                   }
-                  refreshBarDiag();
-              }
-          
-              private static void refreshBarDiag() {
-                  StringBuilder sb = new StringBuilder();
-                  sb.append(bars.size()).append(" 个：");
-                  for (int i = 0; i < bars.size() && i < 3; i++) {
-                      View v = bars.get(i).get();
-                      if (v == null) continue;
-                      if (i > 0) sb.append("；");
-                      sb.append(shortName(v)).append(' ').append(v.getWidth()).append('x').append(v.getHeight())
-                              .append(" α=").append(String.format(Locale.US, "%.1f", v.getAlpha()));
-                  }
-                  diagBar = sb.toString();
-                  diagBarState = (barMode == 2 ? "完全隐藏" : "背景透明") + "（已处理背景 " + bgViews.size() + " 处）";
               }
           
               private static void collectBg(View v, int depth) {
@@ -1201,12 +916,6 @@ jobs:
                       }
                       if (!dup && bars.size() < 4) bars.add(new WeakReference<View>(best));
                   }
-                  if (bars.isEmpty() && barGap > 0) {
-                      View[] best = new View[1];
-                      int[] bestDepth = {Integer.MAX_VALUE};
-                      scanBar(decor, pager, W, H, barGap, 0, best, bestDepth);
-                      if (best[0] != null) bars.add(new WeakReference<View>(best[0]));
-                  }
               }
           
               private static void collectTabTexts(View v, View skip, int H, ArrayList<View> out) {
@@ -1227,26 +936,6 @@ jobs:
                   }
               }
           
-              private static void scanBar(View v, View skip, int W, int H, int gap, int depth,
-                                          View[] best, int[] bestDepth) {
-                  if (v == skip || v.getVisibility() != View.VISIBLE || depth >= bestDepth[0]) return;
-                  int h = v.getHeight();
-                  if (h >= gap - 8 && h <= gap + 40 && v.getWidth() >= 0.9f * W) {
-                      v.getLocationInWindow(tmpLoc);
-                      if (tmpLoc[1] + h >= H - 3) {
-                          best[0] = v;
-                          bestDepth[0] = depth;
-                          return;
-                      }
-                  }
-                  if (v instanceof ViewGroup) {
-                      ViewGroup g = (ViewGroup) v;
-                      for (int i = 0; i < g.getChildCount(); i++) {
-                          scanBar(g.getChildAt(i), skip, W, H, gap, depth + 1, best, bestDepth);
-                      }
-                  }
-              }
-          
               // ================= 配置 =================
           
               private static void loadCfg(Context c) {
@@ -1254,7 +943,6 @@ jobs:
                   cfgLoaded = true;
                   try {
                       SharedPreferences sp = c.getSharedPreferences(PREF, 0);
-                      fullscreen = sp.getBoolean("fullscreen", false);
                       coverVideo = sp.getBoolean("coverVideo", true);
                       barTransparent = sp.getBoolean("barTransparent", true);
                       barHide = sp.getBoolean("barHide", false);
@@ -1266,7 +954,6 @@ jobs:
               private static void saveCfg(Context c) {
                   try {
                       c.getSharedPreferences(PREF, 0).edit()
-                              .putBoolean("fullscreen", fullscreen)
                               .putBoolean("coverVideo", coverVideo)
                               .putBoolean("barTransparent", barTransparent)
                               .putBoolean("barHide", barHide)
@@ -1393,14 +1080,6 @@ jobs:
                                       saveCfg(a);
                                   }
                               });
-                      addSwitch(a, root, "整体拉伸到底部（会改布局，文案会下移）", fullscreen,
-                              new CompoundButton.OnCheckedChangeListener() {
-                                  @Override
-                                  public void onCheckedChanged(CompoundButton b, boolean c) {
-                                      fullscreen = c;
-                                      saveCfg(a);
-                                  }
-                              });
                       addSwitch(a, root, "底栏背景透明（保留图标，视频显示在下方）", barTransparent,
                               new CompoundButton.OnCheckedChangeListener() {
                                   @Override
@@ -1417,7 +1096,6 @@ jobs:
                                       saveCfg(a);
                                   }
                               });
-          
                       addSwitch(a, root, "底栏区域纯黑（把灰色改成黑色，不缩放视频）", pureBlack,
                               new CompoundButton.OnCheckedChangeListener() {
                                   @Override
@@ -1426,7 +1104,7 @@ jobs:
                                       saveCfg(a);
                                   }
                               });
-                      addSwitch(a, root, "接缝黑边/底部补色（实验）", seamFix,
+                      addSwitch(a, root, "接缝黑边/底部补色", seamFix,
                               new CompoundButton.OnCheckedChangeListener() {
                                   @Override
                                   public void onCheckedChanged(CompoundButton b, boolean c) {
@@ -1436,24 +1114,7 @@ jobs:
                               });
           
                       TextView tip = new TextView(a);
-                      tip.setText("回到首页即生效。使用本模块时，请关闭其他模块里的全屏、隐藏底栏等功能，避免互相冲突。"
-                              + "\n\n【状态】（效果不对时请截图本面板）"
-                              + "\n视频流：" + (lastPagerInfo == null ? "还没找到（控件类名可能已变化）"
-                                      : lastPagerInfo + (inFeed ? "，首页中" : "，当前不在首页"))
-                              + "\n底部缺口：" + diagGap
-                              + "\n画面铺满：" + diagCover
-                              + "\n布局拉伸：" + diagFix
-                              + "\n视频页结构：" + diagVideoItem
-                              + "\n其他页（如直播）结构：" + diagOtherItem
-                              + "\n横屏等页结构：" + diagLandItem
-                              + "\n接缝黑边：" + diagCorner
-                              + "\n底部补色：" + diagFill
-                              + "\n纯黑：" + diagBlack
-                              + "\n底栏：" + diagBar
-                              + "\n底栏处理：" + diagBarState
-                              + "\n运行：回调 " + runCount + " 次，首页可见 " + visibleCount
-                              + " 次，应用底栏 " + applyCount + " 次"
-                              + "\n异常：" + diagErr);
+                      tip.setText("回到首页即生效。使用本模块时，请关闭其他模块里的全屏、隐藏底栏等功能，避免互相冲突。");
                       tip.setTextColor(0xFF888888);
                       tip.setTextSize(12);
                       tip.setPadding(0, dp(a, 14), 0, 0);
@@ -1489,7 +1150,6 @@ jobs:
                       d.getWindow().setAttributes(wl);
                   } catch (Throwable t) {
                       menuShowing = false;
-                      XposedBridge.log(TAG + "showMenu 失败: " + t);
                   }
               }
           }
